@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use axum::{
     extract::{Path, Query, WebSocketUpgrade},
-    response::IntoResponse,
+    response::Response,
     Json,
 };
 use dashmap::DashMap;
@@ -57,7 +57,7 @@ pub struct JBResponse<T: Serialize + std::fmt::Debug> {
 #[serde(rename_all = "lowercase")]
 pub enum JBResponseBody<T: Serialize + std::fmt::Debug> {
     Body(T),
-    Error(String),
+    Error(Cow<'static, str>),
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -72,9 +72,15 @@ pub async fn play_handler(
     axum::extract::State(state): axum::extract::State<State>,
     code: Path<String>,
     url_query: Query<WSQuery>,
-) -> impl IntoResponse {
+) -> Result<Response, (StatusCode, Json<JBResponse<()>>)> {
     let Some(config) = state.room_map.get(&code.0) else {
-        return (StatusCode::NOT_FOUND, "Room not found").into_response();
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(JBResponse {
+                ok: false,
+                body: JBResponseBody::Error(Cow::Borrowed("no such room")),
+            }),
+        ));
     };
     let mut host = match url_query.role {
         Role::Audience => "https://ecast.jackboxgames.com".to_owned(),
@@ -85,33 +91,30 @@ pub async fn play_handler(
     host = host.replace("http://", "ws://");
 
     if matches!(state.config.ecast.op_mode, OpMode::Proxy) {
-        ws.protocols(["ecast-v0"])
-            .on_upgrade(move |socket| {
-                let ecast_req = format!(
-                    "{}/api/v2/{}/{}/play?{}",
-                    host,
-                    match url_query.role {
-                        Role::Audience => "audience",
-                        _ => "rooms",
-                    },
-                    code.0,
-                    serde_urlencoded::to_string(&url_query.0).unwrap()
-                );
-                ws::handle_socket_proxy(host, socket, ecast_req, url_query)
-            })
-            .into_response()
+        Ok(ws.protocols(["ecast-v0"]).on_upgrade(move |socket| {
+            let ecast_req = format!(
+                "{}/api/v2/{}/{}/play?{}",
+                host,
+                match url_query.role {
+                    Role::Audience => "audience",
+                    _ => "rooms",
+                },
+                code.0,
+                serde_urlencoded::to_string(&url_query.0).unwrap()
+            );
+            ws::handle_socket_proxy(host, socket, ecast_req, url_query)
+        }))
     } else {
         let room_map = Arc::clone(&state.room_map);
         let room = Arc::clone(config.value());
         let config = Arc::clone(&state.config);
-        ws.protocols(["ecast-v0"])
+        Ok(ws.protocols(["ecast-v0"])
             .on_upgrade(move |socket| async move {
                 if let Err(e) = ws::handle_socket(socket, code, url_query, room, &config.doodles, room_map).await {
                     tracing::error!(id = e.0.profile.id, role = ?e.0.profile.role, error = %e.1, "Error in WebSocket");
                     e.0.disconnect().await;
-                }
-            })
-            .into_response()
+            }
+        }))
     }
 }
 

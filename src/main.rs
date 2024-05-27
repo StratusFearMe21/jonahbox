@@ -380,9 +380,9 @@ async fn main() {
     let handle = axum_server::Handle::new();
 
     let addr = SocketAddr::from(([0, 0, 0, 0], ports.https));
-    tracing::debug!("Ecast listening on {}", addr);
+    tracing::info!("Ecast listening on {}", addr);
     let blobcast_addr = SocketAddr::from(([0, 0, 0, 0], ports.blobcast));
-    tracing::debug!("Blobcast listening on {}", blobcast_addr);
+    tracing::info!("Blobcast listening on {}", blobcast_addr);
     tokio::try_join!(
         axum_server::bind_rustls(addr, tls_config.clone())
             .handle(handle.clone())
@@ -495,7 +495,7 @@ async fn redirect_http_to_https(
         };
 
         let addr = SocketAddr::from(([0, 0, 0, 0], 80));
-        tracing::debug!("listening on {}", addr);
+        tracing::info!("listening on {}", addr);
         axum_server::bind(addr)
             .handle(handle)
             .serve(redirect.into_make_service())

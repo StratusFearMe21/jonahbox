@@ -209,18 +209,27 @@ pub async fn rooms_handler(
 pub async fn rooms_get_handler(
     axum::extract::State(state): axum::extract::State<State>,
     Path(code): Path<String>,
-) -> Result<Json<JBResponse<JBRoom>>, (StatusCode, &'static str)> {
+) -> (StatusCode, Json<JBResponse<JBRoom>>) {
     match state.config.ecast.op_mode {
         OpMode::Native => {
             let room = state.room_map.get(&code);
 
             if let Some(room) = room {
-                return Ok(Json(JBResponse {
-                    ok: true,
-                    body: JBResponseBody::Body(room.value().room_config.clone()),
-                }));
+                return (
+                    StatusCode::OK,
+                    Json(JBResponse {
+                        ok: true,
+                        body: JBResponseBody::Body(room.value().room_config.clone()),
+                    }),
+                );
             } else {
-                return Err((StatusCode::NOT_FOUND, "Room not found"));
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(JBResponse {
+                        ok: false,
+                        body: JBResponseBody::Error(Cow::Borrowed("no such room")),
+                    }),
+                );
             }
         }
         OpMode::Proxy => {
@@ -235,22 +244,11 @@ pub async fn rooms_get_handler(
                     .unwrap_or("https://ecast.jackboxgames.com"),
                 code
             );
-            let mut response: JBResponse<JBRoom> = state
-                .http_cache
-                .client
-                .get(&url)
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            let response = state.http_cache.client.get(&url).send().await.unwrap();
+            let status_code = response.status();
+            let mut response: JBResponse<JBRoom> = response.json().await.unwrap();
 
-            tracing::debug!(
-                url = url,
-                response = ?response,
-                "ecast request"
-            );
+            tracing::debug!(url, ?status_code, ?response, "ecast request");
 
             match &mut response.body {
                 JBResponseBody::Body(body) => {
@@ -260,7 +258,7 @@ pub async fn rooms_get_handler(
                 _ => {}
             }
 
-            Ok(Json(response))
+            (status_code, Json(response))
         }
     }
 }

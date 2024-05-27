@@ -54,12 +54,6 @@ cargo run --release
 
 Or look in [releases](releases) for a binary.
 
-If you don't have an internet connection when running, and you have some games cached, try running in offline mode
-
-```shell
-cargo run --release -- --offline
-```
-
 ### Caching games
 
 There are shell scripts in this project that serve to cache game assets in the server's cache that can't be retrieved in one playthrough.

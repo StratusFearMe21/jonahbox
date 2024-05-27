@@ -49,7 +49,15 @@ pub struct WSQuery {
 #[derive(Deserialize, Serialize, Debug)]
 pub struct JBResponse<T: Serialize + std::fmt::Debug> {
     ok: bool,
-    body: T,
+    #[serde(flatten)]
+    body: JBResponseBody<T>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum JBResponseBody<T: Serialize + std::fmt::Debug> {
+    Body(T),
+    Error(String),
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -144,9 +152,14 @@ pub async fn rooms_handler(
                 "ecast request"
             );
 
-            code = response.body.code;
-            token = response.body.token.parse().unwrap();
-            host = response.body.host;
+            match response.body {
+                JBResponseBody::Body(body) => {
+                    code = body.code;
+                    token = body.token.parse().unwrap();
+                    host = body.host;
+                }
+                JBResponseBody::Error(_) => return Json(response),
+            }
         }
         OpMode::Native => {
             code = crate::room_id();
@@ -182,11 +195,11 @@ pub async fn rooms_handler(
 
     Json(JBResponse {
         ok: true,
-        body: RoomResponse {
+        body: JBResponseBody::Body(RoomResponse {
             host: state.config.accessible_host.clone(),
             code,
             token,
-        },
+        }),
     })
 }
 
@@ -201,7 +214,7 @@ pub async fn rooms_get_handler(
             if let Some(room) = room {
                 return Ok(Json(JBResponse {
                     ok: true,
-                    body: room.value().room_config.clone(),
+                    body: JBResponseBody::Body(room.value().room_config.clone()),
                 }));
             } else {
                 return Err((StatusCode::NOT_FOUND, "Room not found"));
@@ -236,8 +249,13 @@ pub async fn rooms_get_handler(
                 "ecast request"
             );
 
-            response.body.host = state.config.accessible_host.clone();
-            response.body.audience_host = state.config.accessible_host.clone();
+            match &mut response.body {
+                JBResponseBody::Body(body) => {
+                    body.host = state.config.accessible_host.clone();
+                    body.audience_host = state.config.accessible_host.clone();
+                }
+                _ => {}
+            }
 
             Ok(Json(response))
         }
@@ -253,11 +271,11 @@ pub async fn app_config_handler(
         OpMode::Native => {
             return Json(JBResponse {
                 ok: true,
-                body: json!({
+                body: JBResponseBody::Body(json!({
                     "settings": {
                         "serverUrl": state.config.accessible_host.clone()
                     }
-                }),
+                })),
             });
         }
         OpMode::Proxy => {

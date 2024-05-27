@@ -73,6 +73,7 @@ pub async fn generate_handler(
             tracing::debug!(?tts, voice = %voice.display(), out = %out.display(), "Generating TTS");
             let mut piper = std::process::Command::new(state.config.tts.piper_bin.as_path())
                 .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
                 .args([
                     "--length-scale",
                     &length_scale.to_string(),

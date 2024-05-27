@@ -4,42 +4,37 @@ A private server implementation in Rust for modern Jackbox Games services (Ecast
 
 **This project is not related to or endorsed by Jackbox Games, Inc.**
 
+This project extends on the work of [InvoxiPlayGames](https://github.com/InvoxiPlayGames) over on her repo, [johnbox](https://github.com/InvoxiPlayGames/johnbox)
+
 ## Supported Software
 
 ### Tested known working games:
 
+* The Jackbox Party Pack 2 (Audience manually disabled)
+* The Jackbox Party Pack 3 (Audience manually disabled)
+* The Jackbox Party Pack 4 (Audience manually disabled)
+* The Jackbox Party Pack 5 (Audience manually disabled)
+* The Jackbox Party Pack 6 (Audience manually disabled)
+    * Not tested, but I can't imagine why it wouldn't work
 * The Jackbox Party Pack 7
-    * Quiplash 3
-    * Champ'd Up
-    * Blather Round
-    * Talking Points
-    * The Devils and the Details (requires Audience explicitly disabled)
-* The Jackbox Party Pack 8 (all games)
-    * Job Job (requires Audience explicitly disabled)
-* The Jackbox Party Pack 9 (all games)
-* The Jackbox Party Pack 10 (all games)
+* The Jackbox Party Pack 8
+* The Jackbox Party Pack 9
+* The Jackbox Party Pack 10
     * FixyText (does not work, and is probably a wontfix)
 * Drawful 2 International
 
 ### Tested known non-working games:
 
-* The Jackbox Party Pack 8
-    * Job Job (UI on the frontend is bugged, can not progress)
-* Quiplash 2 InterLASHional
-    * Quiplash 2 InterLASHional only uses API v2 for gathering server info. Rooms are still handled via blobcast.
-* The Jackbox Party Pack 6
-    * All games in Party Pack 6 only use API v2 for gathering server info. Rooms are still handled via blobcast.
+* The Jackbox Party Pack
+    * Disregards the `jbg.config.jet` files, and just contacts Jackbox's servers anyway
 * FixyText
     * Requires complex API for collaborative text editing, which is not implemented and difficult to reverse engineer.
-* All games prior use Blobcast / API v1 (likely not the true names), which uses socketio for WebSockets and is currently not supported. 
 
 ## Unimplemented features
 
-* Object security
 * Room passcodes
 * Audiences
 * Moderation features
-* Blobcast / API v1(? what is the real name)
 
 ## Usage
 

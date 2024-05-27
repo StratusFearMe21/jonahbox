@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -24,12 +25,15 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use dashmap::DashMap;
-use futures_util::{stream::SplitSink, SinkExt};
+use futures_util::{
+    stream::{SplitSink, SplitStream},
+    SinkExt,
+};
 use helix_stdx::rope::RegexBuilder;
 use rand::{rngs::OsRng, RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro128PlusPlus;
 use reqwest::header::USER_AGENT;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error, Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     signal,
@@ -45,7 +49,7 @@ mod ecast;
 mod entity;
 mod http_cache;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Token([u8; 12]);
 
 impl From<[u8; 12]> for Token {
@@ -70,14 +74,22 @@ impl<'de> Deserialize<'de> for Token {
     {
         let token: Cow<'de, str> = Deserialize::deserialize(deserializer)?;
         let mut bytes = [0u8; 12];
-        let len = token
-            .as_bytes()
-            .chunks(2)
-            .zip(bytes.iter_mut())
-            .map(|(bi, bo)| {
-                *bo = u8::from_str_radix(unsafe { std::str::from_utf8_unchecked(bi) }, 16).unwrap()
-            })
-            .count();
+        let len =
+            token
+                .as_bytes()
+                .chunks(2)
+                .zip(bytes.iter_mut())
+                .try_fold(0, |count, (bi, bo)| {
+                    let hex_str = unsafe { std::str::from_utf8_unchecked(bi) };
+                    *bo = u8::from_str_radix(hex_str, 16).map_err(|_| {
+                        D::Error::invalid_value(
+                            serde::de::Unexpected::Str(hex_str),
+                            &"A hexadecimal number",
+                        )
+                    })?;
+
+                    Ok(count + 1)
+                })?;
         assert_eq!(len, 12);
         Ok(Token(bytes))
     }
@@ -150,7 +162,7 @@ struct Ecast {
     server_url: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct Tls {
     cert: PathBuf,
     key: PathBuf,
@@ -226,23 +238,28 @@ pub struct Client {
     socket: Mutex<Option<SplitSink<WebSocket, Message>>>,
     pc: AtomicU64,
     client_type: ClientType,
+    secret: Token,
 }
 
 impl Client {
     pub async fn send_ecast(
         &self,
         mut message: ecast::ws::JBMessage<'_>,
-    ) -> Result<(), axum::Error> {
+    ) -> Result<(), anyhow::Error> {
         message.pc = self.pc.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
         tracing::debug!(id = self.profile.id, role = ?self.profile.role, ?message, "Sending WS Message");
 
         if let Err(e) = self
-            .send_ws_message(Message::Text(serde_json::to_string(&message).unwrap()))
+            .send_ws_message(Message::Text(
+                serde_json::to_string(&message).with_context(|| {
+                    format!("Failed to serialize ecast message: {:?}", &message)
+                })?,
+            ))
             .await
         {
             self.disconnect().await;
-            return Err(e);
+            return Err(e).with_context(|| format!("Ecast message failed to send: {:?}", &message));
         }
 
         Ok(())
@@ -251,49 +268,53 @@ impl Client {
     pub async fn send_blobcast(
         &self,
         message: blobcast::ws::JBMessage<'_>,
-    ) -> Result<(), axum::Error> {
+    ) -> Result<(), anyhow::Error> {
         tracing::debug!(id = self.profile.id, role = ?self.profile.role, ?message, "Sending WS Message");
 
         if let Err(e) = self
             .send_ws_message(Message::Text(format!(
                 "5:::{}",
-                serde_json::to_string(&message).unwrap()
+                serde_json::to_string(&message).with_context(|| {
+                    format!("Failed to serialize blobcast message: {:?}", &message)
+                })?
             )))
             .await
         {
             self.disconnect().await;
-            return Err(e);
+            return Err(e)
+                .with_context(|| format!("Blobcast message failed to send: {:?}", &message));
         }
 
         Ok(())
     }
 
-    pub async fn ping(&self, d: Vec<u8>) -> Result<(), axum::Error> {
+    pub async fn ping(&self, d: Vec<u8>) -> Result<(), anyhow::Error> {
         if let Err(e) = self.send_ws_message(Message::Ping(d)).await {
             self.disconnect().await;
-            return Err(e);
+            return Err(e).context("Failed to ping socket");
         }
 
         Ok(())
     }
 
-    pub async fn pong(&self, d: Vec<u8>) -> Result<(), axum::Error> {
+    pub async fn pong(&self, d: Vec<u8>) -> Result<(), anyhow::Error> {
         if let Err(e) = self.send_ws_message(Message::Pong(d)).await {
             self.disconnect().await;
-            return Err(e);
+            return Err(e).context("Failed to pong socket");
         }
 
         Ok(())
     }
 
-    pub async fn close(&self) -> Result<(), axum::Error> {
+    pub async fn close(&self) -> Result<(), anyhow::Error> {
         tracing::debug!(id = self.profile.id, role = ?self.profile.role, "Closing connection");
 
         self.send_ws_message(Message::Close(Some(axum::extract::ws::CloseFrame {
             code: 1000,
             reason: Cow::Borrowed("normal close"),
         })))
-        .await?;
+        .await
+        .context("Failed to close connection")?;
 
         Ok(())
     }
@@ -302,10 +323,10 @@ impl Client {
         *self.socket.lock().await = None;
     }
 
-    pub async fn send_ws_message(&self, message: Message) -> Result<(), axum::Error> {
+    pub async fn send_ws_message(&self, message: Message) -> Result<(), anyhow::Error> {
         if let Some(socket) = self.socket.lock().await.deref_mut() {
             tokio::select! {
-                r = socket.send(message) => r?,
+                r = socket.send(message) => r.context("WS Message failed to send")?,
                 _ = tokio::time::sleep(Duration::from_secs(3)) => {
                     tracing::error!(id = self.profile.id, role = ?self.profile.role, "Connection timed out");
                     self.disconnect().await;
@@ -325,28 +346,40 @@ pub struct Room {
     pub exit: Notify,
 }
 
+pub struct ConnectedSocket {
+    pub client: Arc<Client>,
+    pub room: Arc<Room>,
+    pub read_half: SplitStream<WebSocket>,
+    pub reconnected: bool,
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_default())
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config: Config = toml::from_str(&std::fs::read_to_string("config.toml").unwrap()).unwrap();
+    let config_file =
+        std::fs::read_to_string("config.toml").context("Could not read config.toml")?;
+    let config: Config = toml::from_str(&config_file)
+        .with_context(|| format!("Failed to deserialize config.toml: {}", config_file))?;
 
     let tls_config = RustlsConfig::from_pem_file(&config.tls.cert, &config.tls.key)
         .await
-        .unwrap();
+        .with_context(|| format!("TLS Config failed: {:?}", config.tls))?;
 
     let fragment_regex = RegexBuilder::new()
         .build("blobcast.jackboxgames.com|ecast.jackboxgames.com|bundles.jackbox.tv|jackbox.tv|cdn.jackboxgames.com|s3.amazonaws.com")
-        .unwrap();
-    let content_to_compress = RegexBuilder::new().build("text/html|text/css|text/xml|text/javascript|application/javascript|application/x-javascript|application/json").unwrap();
+        .context("fragment_regex failed to build")?;
+    let content_to_compress = RegexBuilder::new().build("text/html|text/css|text/xml|text/javascript|application/javascript|application/x-javascript|application/json").context("content_to_compress regex failed to build")?;
 
     let js_lang = tree_sitter_javascript::language();
-    let fragment_query = tree_sitter::Query::new(&js_lang, "(string_fragment) @frag").unwrap();
+    let fragment_query = tree_sitter::Query::new(&js_lang, "(string_fragment) @frag")
+        .context("fragment_query failed to build")?;
     let css_lang = tree_sitter_css::language();
-    let css_query = tree_sitter::Query::new(&css_lang, "(plain_value) @frag").unwrap();
+    let css_query = tree_sitter::Query::new(&css_lang, "(plain_value) @frag")
+        .context("css_query failed to build")?;
     let state = State {
         blobcast_host: Arc::new(RwLock::new(String::new())),
         room_map: Arc::new(DashMap::new()),
@@ -365,7 +398,12 @@ async fn main() {
 
     tokio::fs::create_dir_all(&state.config.doodles.path)
         .await
-        .unwrap();
+        .with_context(|| {
+            format!(
+                "Failed to create doodles dir: {}",
+                state.config.doodles.path.display()
+            )
+        })?;
 
     let ports = state.config.ports;
 
@@ -404,8 +442,9 @@ async fn main() {
             .serve(app.into_make_service()),
         redirect_http_to_https(ports, handle.clone()),
         shutdown_signal(handle)
-    )
-    .unwrap();
+    )?;
+
+    Ok(())
 }
 
 async fn serve_jb_tv(

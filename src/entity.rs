@@ -3,6 +3,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicI64},
 };
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use tokio::io::Interest;
@@ -107,11 +108,6 @@ impl JBAttributes {
     }
 }
 
-#[inline(always)]
-const fn one() -> usize {
-    1
-}
-
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct JBDoodle {
@@ -121,7 +117,7 @@ pub struct JBDoodle {
     pub live: bool,
     #[serde(default)]
     pub max_points: usize,
-    #[serde(default = "one")]
+    #[serde(default)]
     pub max_layer: usize,
     #[serde(default)]
     pub size: JBSize,
@@ -131,40 +127,52 @@ pub struct JBDoodle {
 }
 
 impl JBDoodle {
-    pub fn render(&self) -> Pixmap {
-        let mut layers =
-            vec![Pixmap::new(self.size.width, self.size.height).unwrap(); self.max_layer];
+    pub fn render(&self) -> anyhow::Result<Pixmap> {
+        let mut layers = vec![
+            Pixmap::new(self.size.width, self.size.height).with_context(
+                || format!("Failed to create Pixmap of size {:?}", self.size)
+            )?;
+            self.max_layer.max(1)
+        ];
 
         for line in self.lines.iter() {
             if !line.points.is_empty() {
-                let layer = layers.get_mut(line.layer).unwrap();
+                let layer = layers.get_mut(line.layer).with_context(|| {
+                    format!(
+                        "No such layer {} out of {} layers",
+                        line.layer, self.max_layer
+                    )
+                })?;
                 let mut path = PathBuilder::new();
                 let mut points = line.points.iter();
-                let move_to = points.next().unwrap();
-                path.move_to(move_to.x, move_to.y);
+                if let Some(move_to) = points.next() {
+                    path.move_to(move_to.x, move_to.y);
 
-                for point in points {
-                    path.line_to(point.x, point.y);
+                    for point in points {
+                        path.line_to(point.x, point.y);
+                    }
+
+                    let path = path.finish().with_context(|| {
+                        format!("Failed to create path from points: {:?}", line.points)
+                    })?;
+                    let line_color = line.color.to_rgba8();
+                    let paint = Paint {
+                        shader: tiny_skia::Shader::SolidColor(Color::from_rgba8(
+                            line_color[0],
+                            line_color[1],
+                            line_color[2],
+                            line_color[3],
+                        )),
+                        anti_alias: true,
+                        ..Default::default()
+                    };
+                    let stroke = Stroke {
+                        width: line.weight * 2.0,
+                        line_cap: tiny_skia::LineCap::Round,
+                        ..Default::default()
+                    };
+                    layer.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
                 }
-
-                let path = path.finish().unwrap();
-                let line_color = line.color.to_rgba8();
-                let paint = Paint {
-                    shader: tiny_skia::Shader::SolidColor(Color::from_rgba8(
-                        line_color[0],
-                        line_color[1],
-                        line_color[2],
-                        line_color[3],
-                    )),
-                    anti_alias: true,
-                    ..Default::default()
-                };
-                let stroke = Stroke {
-                    width: line.weight * 2.0,
-                    line_cap: tiny_skia::LineCap::Round,
-                    ..Default::default()
-                };
-                layer.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
             }
         }
 
@@ -185,7 +193,7 @@ impl JBDoodle {
             );
         }
 
-        layers.swap_remove(0)
+        Ok(layers.swap_remove(0))
     }
 }
 

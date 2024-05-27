@@ -1,5 +1,6 @@
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
+use anyhow::Context;
 use axum::{
     extract::{Path, Query, WebSocketUpgrade},
     response::Response,
@@ -102,19 +103,34 @@ pub async fn play_handler(
                 code.0,
                 serde_urlencoded::to_string(&url_query.0).unwrap()
             );
-            ws::handle_socket_proxy(host, socket, ecast_req, url_query)
+            async move {
+                if let Err(e) = ws::handle_socket_proxy(host, socket, ecast_req).await {
+                    tracing::error!(error = %e, "Failed to proxy ecast client");
+                }
+            }
         }))
     } else {
-        let room_map = Arc::clone(&state.room_map);
         let room = Arc::clone(config.value());
         let config = Arc::clone(&state.config);
         Ok(ws.protocols(["ecast-v0"])
             .on_upgrade(move |socket| async move {
-                if let Err(e) = ws::handle_socket(socket, code, url_query, room, &config.doodles, room_map).await {
-                    tracing::error!(id = e.0.profile.id, role = ?e.0.profile.role, error = %e.1, "Error in WebSocket");
-                    e.0.disconnect().await;
-            }
-        }))
+                match ws::connect_socket(socket, url_query, room).await.context("Failed to connect ecast client") {
+                    Err(e) => {
+                        tracing::error!(%e);
+                        return;
+                    }
+                    Ok(connected) => {
+                        if let Err(e) = ws::handle_socket(Arc::clone(&connected.client), Arc::clone(&connected.room), connected.reconnected, connected.read_half, &config.doodles).await {
+                            tracing::error!(id = connected.client.profile.id, role = ?connected.client.profile.role, error = %e, "Error in WebSocket");
+                            connected.client.disconnect().await;
+                        } else {
+                            connected.client.disconnect().await;
+                            tracing::debug!(id = connected.client.profile.id, role = ?connected.client.profile.role, "Leaving room");
+                        }
+                    }
+                }
+            })
+        )
     }
 }
 
@@ -137,6 +153,7 @@ pub async fn rooms_handler(
                     .map(|s| s.as_str())
                     .unwrap_or("https://ecast.jackboxgames.com")
             );
+
             let response: JBResponse<RoomResponse> = state
                 .http_cache
                 .client

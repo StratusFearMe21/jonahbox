@@ -11,12 +11,13 @@ use crate::{
     acl::{Acl, Role},
     ecast::ws::JBResult,
     entity::{JBAttributes, JBEntity, JBObject, JBRestrictions, JBType, JBValue},
-    Client, ClientType, JBProfile, Room,
+    Client, ClientType, ConnectedSocket, JBProfile, Room, Token,
 };
 
+use anyhow::{anyhow, bail, Context};
 use axum::extract::ws::{Message, WebSocket};
 use dashmap::DashMap;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::SplitStream, SinkExt, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::Interest,
@@ -31,13 +32,23 @@ struct WSMessage<'a> {
 }
 
 impl<'a> FromStr for WSMessage<'a> {
-    type Err = Option<u8>;
+    type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.split_once("::").ok_or(None)?;
-        let opcode: u8 = s.0.parse().or(Err(None))?;
+        let s = s
+            .split_once("::")
+            .ok_or_else(|| anyhow!("Failed to split socket.io message: {}", s))?;
+        let opcode: u8 =
+            s.0.parse()
+                .with_context(|| format!("Opcode is not a valid number: {}", s.0))?;
         let message: Option<JBMessage> = if opcode == 5 {
-            serde_json::from_str(&s.1.get(1..).ok_or(Some(opcode))?).or(Err(Some(opcode)))?
+            let message =
+                s.1.get(1..)
+                    .with_context(|| format!("Opcode 5 contains no message: {}", s.1))?;
+            Some(
+                serde_json::from_str(&message)
+                    .with_context(|| format!("Failed to deserialize message: {}", message))?,
+            )
         } else {
             None
         };
@@ -122,23 +133,38 @@ pub struct JBArgs<'a> {
     pub success: Option<bool>,
 }
 
-pub async fn handle_socket(
+pub async fn connect_socket(
     socket: WebSocket,
     room_map: Arc<DashMap<String, Arc<Room>>>,
     host: String,
-) -> Result<(), (Arc<Client>, axum::Error)> {
+) -> anyhow::Result<ConnectedSocket> {
     let (mut ws_write, mut ws_read) = socket.split();
 
     ws_write
         .send(Message::Text("1::".to_owned()))
         .await
-        .unwrap();
+        .context("Failed to send blobcast connection message: ::1")?;
 
-    let Message::Text(create_room) = ws_read.next().await.unwrap().unwrap() else {
-        unreachable!()
+    let create_room_msg = ws_read
+        .next()
+        .await
+        .context("Failed to receive CreateRoom message")?
+        .context("CreateRoom message is a None")?;
+
+    let Message::Text(create_room) = create_room_msg else {
+        bail!(
+            "Expected a Message::Text for create room, got: {:?}",
+            create_room_msg
+        );
     };
 
-    let create_room = WSMessage::from_str(&create_room).unwrap();
+    let create_room = WSMessage::from_str(&create_room).with_context(|| {
+        format!(
+            "Failed to deserialize CreateRoom WS Message: {}",
+            create_room
+        )
+    })?;
+
     let room_code = crate::room_id();
 
     let room = Arc::new(Room {
@@ -146,14 +172,28 @@ pub async fn handle_socket(
         connections: DashMap::new(),
         room_serial: 1.into(),
         room_config: crate::JBRoom {
-            app_tag: super::APP_TAGS
-                .get(&create_room.message.as_ref().unwrap().args.get_args().app_id)
-                .map(|s| s.to_string())
-                .unwrap_or_default(),
+            app_tag: {
+                let app_id = create_room
+                    .message
+                    .as_ref()
+                    .with_context(|| format!("CreateRoom contained no message: {:?}", create_room))?
+                    .args
+                    .get_args()
+                    .app_id
+                    .as_str();
+
+                super::APP_TAGS
+                    .get(app_id)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        tracing::warn!("No app tag found for blobcast app id: {}", app_id);
+                        String::new()
+                    })
+            },
             app_id: create_room
                 .message
                 .as_ref()
-                .unwrap()
+                .with_context(|| format!("CreateRoom contained no message: {:?}", create_room))?
                 .args
                 .get_args()
                 .app_id
@@ -191,50 +231,60 @@ pub async fn handle_socket(
             room_code
         )))
         .await
-        .unwrap();
+        .context("Failed to send result of CreateRoom")?;
 
-    let client: Arc<Client> = {
-        let serial = room
-            .room_serial
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let serial = room
+        .room_serial
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
-        let profile = JBProfile {
-            id: serial,
-            roles: crate::JBProfileRoles::Host {},
-            user_id: create_room
-                .message
-                .as_ref()
-                .unwrap()
-                .args
-                .get_args()
-                .user_id
-                .clone()
-                .into_owned(),
-            role: Role::Host,
-            name: String::new(),
-        };
-
-        let client = Arc::new(Client {
-            pc: 0.into(),
-            profile,
-            socket: Mutex::new(Some(ws_write)),
-            client_type: ClientType::Blobcast,
-        });
-        room.connections.insert(serial, Arc::clone(&client));
-        client
+    let profile = JBProfile {
+        id: serial,
+        roles: crate::JBProfileRoles::Host {},
+        user_id: create_room
+            .message
+            .as_ref()
+            .with_context(|| format!("CreateRoom contained no message: {:?}", create_room))?
+            .args
+            .get_args()
+            .user_id
+            .clone()
+            .into_owned(),
+        role: Role::Host,
+        name: String::new(),
     };
 
+    let client = Arc::new(Client {
+        pc: 0.into(),
+        profile,
+        socket: Mutex::new(Some(ws_write)),
+        client_type: ClientType::Blobcast,
+        secret: Token::random(),
+    });
+    room.connections.insert(serial, Arc::clone(&client));
+    Ok(ConnectedSocket {
+        client,
+        room,
+        read_half: ws_read,
+        reconnected: false,
+    })
+}
+
+pub async fn handle_socket(
+    mut ws_read: SplitStream<WebSocket>,
+    room: Arc<Room>,
+    client: Arc<Client>,
+) -> anyhow::Result<()> {
     'outer: loop {
         tokio::select! {
             ws_message = ws_read.next() => {
                 match ws_message {
                     Some(Ok(ws_message)) => {
                         let message: WSMessage = match ws_message {
-                            Message::Text(ref t) => WSMessage::from_str(t).unwrap(),
+                            Message::Text(ref t) => WSMessage::from_str(t)
+                                .with_context(|| format!("Failed to deserialize message: {}", t))?,
                             Message::Close(_) => break 'outer,
                             Message::Ping(d) => {
-                                client.pong(d).await
-                                    .map_err(|e| (Arc::clone(&client), e))?;
+                                client.pong(d).await?;
                                 continue;
                             }
                             _ => continue,
@@ -242,7 +292,7 @@ pub async fn handle_socket(
                         tracing::debug!(id = client.profile.id, role = ?client.profile.role, ?message, "Recieved WS Message");
                         if let Some(ref message) = message.message {
                             process_message(&client, message, &room).await
-                                .map_err(|e| (Arc::clone(&client), e))?;
+                                .with_context(|| format!("Failed to process message: {:?}", message))?;
                         }
                         tracing::debug!("Message Processed");
                     }
@@ -256,19 +306,13 @@ pub async fn handle_socket(
             }
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 client.send_ws_message(Message::Text(String::from("2:::"))).await
-                    .map_err(|e| (Arc::clone(&client), e))?;
+                    .context("Failed to send blobcast ping to client")?;
             }
             _ = room.exit.notified() => {
                 break
             }
         }
     }
-
-    client.disconnect().await;
-    tracing::debug!(id = client.profile.id, role = ?client.profile.role, "Leaving room");
-    room.exit.notify_waiters();
-    tracing::debug!(room_code, "Removing room");
-    room_map.remove(&room_code);
 
     Ok(())
 }
@@ -277,7 +321,7 @@ async fn process_message(
     client: &Client,
     message: &JBMessage<'_>,
     room: &Room,
-) -> Result<(), axum::Error> {
+) -> anyhow::Result<()> {
     match message.args.get_args().action.as_ref() {
         "SetRoomBlob" => {
             let entity = {
@@ -287,7 +331,13 @@ async fn process_message(
                     JBObject {
                         key: "bc:room".to_owned(),
                         val: Some(JBValue::Object(
-                            message.args.get_args().blob.as_object().cloned().unwrap(),
+                            message
+                                .args
+                                .get_args()
+                                .blob
+                                .as_object()
+                                .cloned()
+                                .context("No blob in SetRoomBlob message")?,
                         )),
                         restrictions: JBRestrictions::default(),
                         version: prev_value
@@ -312,7 +362,8 @@ async fn process_message(
                                 re: None,
                                 result: &value,
                             })
-                            .await?;
+                            .await
+                            .context("Failed to send room blob to ecast client")?;
                     }
                     ClientType::Blobcast => {
                         client
@@ -322,11 +373,18 @@ async fn process_message(
                                     arg_type: Cow::Borrowed("Event"),
                                     action: Cow::Borrowed("RoomBlobChanged"),
                                     room_id: Cow::Borrowed(&room.room_config.code),
-                                    blob: serde_json::to_value(&entity.1.val).unwrap(),
+                                    blob: serde_json::to_value(&entity.1.val).with_context(
+                                        || {
+                                            format!(
+                                                "Failed to convert entity to serde_json::Value: {:?}",
+                                                entity.1.val
+                                            )
+                                        },
+                                    )?,
                                     ..Default::default()
                                 }]),
                             })
-                            .await?;
+                            .await.context("Failed to ACK RoomBlob to blobcast host")?;
                     }
                 }
             }
@@ -341,7 +399,8 @@ async fn process_message(
                         ..Default::default()
                     }]),
                 })
-                .await?;
+                .await
+                .context("Failed to send result of SetRoomBlob")?;
         }
         "SetCustomerBlob" => {
             let user_id = message.args.get_args().customer_user_id.as_ref();
@@ -350,7 +409,7 @@ async fn process_message(
                 .connections
                 .iter()
                 .find(|c| c.profile.user_id == user_id)
-                .unwrap();
+                .with_context(|| format!("No connection found for user_id: {}", user_id))?;
             let entity = {
                 let prev_value = room.entities.get(&key);
                 JBEntity(
@@ -358,7 +417,13 @@ async fn process_message(
                     JBObject {
                         key: key.clone(),
                         val: Some(JBValue::Object(
-                            message.args.get_args().blob.as_object().cloned().unwrap(),
+                            message
+                                .args
+                                .get_args()
+                                .blob
+                                .as_object()
+                                .cloned()
+                                .context("No blob in SetCustomerBlob message")?,
                         )),
                         restrictions: JBRestrictions::default(),
                         version: prev_value
@@ -382,7 +447,8 @@ async fn process_message(
                     re: None,
                     result: &JBResult::Object(&entity.1),
                 })
-                .await?;
+                .await
+                .context("Failed to send customer blob to ecast client")?;
             room.entities.insert(key, entity);
         }
         "LockRoom" => {
@@ -397,85 +463,107 @@ async fn process_message(
                         ..Default::default()
                     }]),
                 })
-                .await?;
+                .await
+                .context("Failed to send result of LockRoom to blobcast host")?;
         }
-        a => unimplemented!("Unimplemented blobcast action {:?}", a),
+        a => bail!("Unimplemented blobcast action {:?}", a),
     }
 
     Ok(())
 }
 
-pub async fn handle_socket_proxy(host: String, socket: WebSocket, ecast_req: String) {
+pub async fn handle_socket_proxy(
+    host: String,
+    socket: WebSocket,
+    blobcast_req: String,
+) -> anyhow::Result<()> {
     tracing::debug!(host = host, "proying blobcast to");
-    let ecast_req = ecast_req.into_client_request().unwrap();
-    let (ecast_connection, _) = tokio_tungstenite::connect_async(ecast_req).await.unwrap();
+    let blobcast_req = blobcast_req
+        .into_client_request()
+        .context("blobcast_req could not be converted to a client request")?;
+    let (blobcast_connection, _) = tokio_tungstenite::connect_async(blobcast_req)
+        .await
+        .context("Failed to connect to blobcast proxy")?;
 
     let (local_write, local_read) = socket.split();
 
-    let (ecast_write, ecast_read) = ecast_connection.split();
+    let (blobcast_write, blobcast_read) = blobcast_connection.split();
 
-    let local_to_ecast = local_read
-        .map(move |m| {
-            let m = match m.unwrap() {
-                axum::extract::ws::Message::Text(m) => {
-                    let mut sm = m.split(":::");
-                    let opcode = sm.next().unwrap();
-                    let json_message = sm.next();
-                    tracing::debug!(
-                        role = ?Role::Host,
-                        opcode = opcode,
-                        message = %{
-                            json_message.map(|m| {
-                                let jq = std::process::Command::new("jq")
-                                    .stdin(Stdio::piped())
-                                    .stdout(Stdio::piped())
-                                    .arg("-C")
-                                    .spawn()
-                                    .unwrap();
-                                let mut jq_in = jq.stdin.unwrap();
-                                let mut jq_out = jq.stdout.unwrap();
-                                jq_in.write_all(m.as_bytes()).unwrap();
-                                jq_in.write_all(b"\n").unwrap();
-                                drop(jq_in);
-                                let mut jm = String::new();
-                                jq_out.read_to_string(&mut jm).unwrap();
-                                jm
-                            }).unwrap_or_default()
-                        },
-                        "to blobcast",
-                    );
-                    return Ok(tokio_tungstenite::tungstenite::Message::Text(m));
-                }
-                axum::extract::ws::Message::Binary(m) => {
-                    Ok(tokio_tungstenite::tungstenite::Message::Binary(m))
-                }
-                axum::extract::ws::Message::Ping(m) => {
-                    Ok(tokio_tungstenite::tungstenite::Message::Ping(m))
-                }
-                axum::extract::ws::Message::Pong(m) => {
-                    Ok(tokio_tungstenite::tungstenite::Message::Pong(m))
-                }
-                axum::extract::ws::Message::Close(m) => {
-                    Ok(tokio_tungstenite::tungstenite::Message::Close(m.map(|f| {
-                        tokio_tungstenite::tungstenite::protocol::CloseFrame {
-                            code: f.code.into(),
-                            reason: f.reason,
-                        }
-                    })))
-                }
-            };
-            tracing::debug!(
-                role = ?Role::Host,
-                message = ?m,
-                "to blobcast",
-            );
-            m
+    let local_to_blobcast = local_read
+        .map_err(|e: axum::Error| anyhow!("local_to_blobcast stream broken: {}", e))
+        .map(
+            move |m| -> Result<tokio_tungstenite::tungstenite::Message, anyhow::Error> {
+                let m = match m.context("local_to_blobcast message failed to be received")? {
+                    axum::extract::ws::Message::Text(m) => {
+                        let mut sm = m.split(":::");
+                        let opcode = sm.next().unwrap();
+                        let json_message = sm.next();
+                        tracing::debug!(
+                            role = ?Role::Host,
+                            opcode = opcode,
+                            message = %{
+                                json_message.map(|m| -> anyhow::Result<String> {
+                                    if let Ok(jq) = std::process::Command::new("jq")
+                                        .stdin(Stdio::piped())
+                                        .stdout(Stdio::piped())
+                                        .arg("-C")
+                                        .spawn() {
+                                            let mut jq_in = jq.stdin.context("jq process has no stdin")?;
+                                            let mut jq_out = jq.stdout.context("jq process has no stdout")?;
+                                            jq_in.write_all(m.as_bytes())
+                                                .context("Failed to write to jq process")?;
+                                            jq_in.write_all(b"\n")
+                                                .context("Failed to write to jq process")?;
+                                            drop(jq_in);
+                                            let mut jm = String::new();
+                                            jq_out.read_to_string(&mut jm)
+                                                .context("Failed to read from jq process")?;
+                                            Ok(jm)
+                                        } else {
+                                            Ok(m.to_owned())
+                                        }
+                                })
+                                .unwrap_or_else(|| Ok(String::new()))
+                                .with_context(|| format!("jq coloration failed for message: {:?}", json_message))?
+                            },
+                            "to blobcast",
+                        );
+                        return Ok(tokio_tungstenite::tungstenite::Message::Text(m));
+                    }
+                    axum::extract::ws::Message::Binary(m) => {
+                        Ok(tokio_tungstenite::tungstenite::Message::Binary(m))
+                    }
+                    axum::extract::ws::Message::Ping(m) => {
+                        Ok(tokio_tungstenite::tungstenite::Message::Ping(m))
+                    }
+                    axum::extract::ws::Message::Pong(m) => {
+                        Ok(tokio_tungstenite::tungstenite::Message::Pong(m))
+                    }
+                    axum::extract::ws::Message::Close(m) => {
+                        Ok(tokio_tungstenite::tungstenite::Message::Close(m.map(|f| {
+                            tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                code: f.code.into(),
+                                reason: f.reason,
+                            }
+                        })))
+                    }
+                };
+                tracing::debug!(
+                    role = ?Role::Host,
+                    message = ?m,
+                    "to blobcast",
+                );
+                m
+            },
+        )
+        .forward(blobcast_write.sink_map_err(|e| anyhow!(e)));
+
+    let blobcast_to_local = blobcast_read
+        .map_err(|e: tokio_tungstenite::tungstenite::Error| {
+            anyhow!("blobcast_to_local stream broken: {}", e)
         })
-        .forward(ecast_write);
-
-    let ecast_to_local = ecast_read
-        .map(|m| {
-            let m = match m.unwrap() {
+        .map(|m| -> Result<axum::extract::ws::Message, anyhow::Error> {
+            let m = match m.context("blobcast_to_local message failed to be received")? {
                 tokio_tungstenite::tungstenite::Message::Text(m) => {
                     let mut sm = m.split(":::");
                     let opcode = sm.next().unwrap();
@@ -484,22 +572,29 @@ pub async fn handle_socket_proxy(host: String, socket: WebSocket, ecast_req: Str
                         role = ?Role::Host,
                         opcode = opcode,
                         message = %{
-                            json_message.map(|m| {
-                                let jq = std::process::Command::new("jq")
+                            json_message.map(|m| -> anyhow::Result<String> {
+                                if let Ok(jq) = std::process::Command::new("jq")
                                     .stdin(Stdio::piped())
                                     .stdout(Stdio::piped())
                                     .arg("-C")
-                                    .spawn()
-                                    .unwrap();
-                                let mut jq_in = jq.stdin.unwrap();
-                                let mut jq_out = jq.stdout.unwrap();
-                                jq_in.write_all(m.as_bytes()).unwrap();
-                                jq_in.write_all(b"\n").unwrap();
-                                drop(jq_in);
-                                let mut jm = String::new();
-                                jq_out.read_to_string(&mut jm).unwrap();
-                                jm
-                            }).unwrap_or_default()
+                                    .spawn() {
+                                        let mut jq_in = jq.stdin.context("jq process has no stdin")?;
+                                        let mut jq_out = jq.stdout.context("jq process has no stdout")?;
+                                        jq_in.write_all(m.as_bytes())
+                                            .context("Failed to write to jq process")?;
+                                        jq_in.write_all(b"\n")
+                                            .context("Failed to write to jq process")?;
+                                        drop(jq_in);
+                                        let mut jm = String::new();
+                                        jq_out.read_to_string(&mut jm)
+                                            .context("Failed to read from jq process")?;
+                                        Ok(jm)
+                                    } else {
+                                        Ok(m.to_owned())
+                                    }
+                            })
+                            .unwrap_or_else(|| Ok(String::new()))
+                            .with_context(|| format!("jq coloration failed for message: {:?}", json_message))?
                         },
                         "blobcast to",
                     );
@@ -522,7 +617,7 @@ pub async fn handle_socket_proxy(host: String, socket: WebSocket, ecast_req: Str
                         }
                     })))
                 }
-                tokio_tungstenite::tungstenite::Message::Frame(_) => unimplemented!(),
+                tokio_tungstenite::tungstenite::Message::Frame(f) => bail!("Failed to proxy unimplemented raw frame: {:?}", f),
             };
             tracing::debug!(
                 role = ?Role::Host,
@@ -531,12 +626,12 @@ pub async fn handle_socket_proxy(host: String, socket: WebSocket, ecast_req: Str
             );
             m
         })
-        .forward(local_write);
+        .forward(local_write.sink_map_err(|e| anyhow!(e)));
 
-    tokio::pin!(local_to_ecast, ecast_to_local);
+    tokio::pin!(local_to_blobcast, blobcast_to_local);
 
     tokio::select! {
-        _ = local_to_ecast => {}
-        _ = ecast_to_local => {}
+        r = local_to_blobcast => r,
+        r = blobcast_to_local => r
     }
 }

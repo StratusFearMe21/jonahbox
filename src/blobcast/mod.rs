@@ -1,5 +1,6 @@
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
+use anyhow::Context;
 use axum::{
     extract::{Path, Query, WebSocketUpgrade},
     response::IntoResponse,
@@ -63,16 +64,34 @@ pub async fn play_handler(
 
         ws.on_upgrade(move |socket| {
             let ecast_req = format!("{}/socket.io/websocket/{}", host, id.0);
-            ws::handle_socket_proxy(host, socket, ecast_req)
+            async move {
+                if let Err(e) = ws::handle_socket_proxy(host, socket, ecast_req).await {
+                    tracing::error!(error = %e, "Failed to proxy blobcast host");
+                }
+            }
         })
         .into_response()
     } else {
         let room_map = Arc::clone(&state.room_map);
         ws
             .on_upgrade(move |socket| async move {
-                if let Err(e) = ws::handle_socket(socket, room_map, state.config.accessible_host.clone()).await {
-                    tracing::error!(id = e.0.profile.id, role = ?e.0.profile.role, error = %e.1, "Error in WebSocket");
-                    e.0.disconnect().await;
+                match ws::connect_socket(socket, Arc::clone(&room_map), state.config.accessible_host.clone()).await.context("Failed to connect blobcast socket") {
+                    Err(e) => {
+                        tracing::error!(%e);
+                        return;
+                    }
+                    Ok(socket) => {
+                        if let Err(e) = ws::handle_socket(socket.read_half, Arc::clone(&socket.room), Arc::clone(&socket.client)).await {
+                            tracing::error!(id = socket.client.profile.id, role = ?socket.client.profile.role, error = %e, "Error in WebSocket");
+                            socket.client.disconnect().await;
+                        } else {
+                            tracing::debug!(id = socket.client.profile.id, role = ?socket.client.profile.role, "Leaving room");
+                            socket.client.disconnect().await;
+                            socket.room.exit.notify_waiters();
+                            tracing::debug!(socket.room.room_config.code, "Removing room");
+                            room_map.remove(&socket.room.room_config.code);
+                        }
+                    }
                 }
             })
             .into_response()

@@ -413,7 +413,6 @@ async fn serve_jb_tv(
     headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, (StatusCode, String)> {
-    tracing::error!(?uri);
     if uri.query().is_some_and(|q| q.contains("&s=")) {
         let mut new_query: String = format!("{}?", uri.path());
         new_query.extend(

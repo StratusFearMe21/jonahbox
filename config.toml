@@ -17,7 +17,7 @@ cache_mode = "online"
 #
 # cache_mode = "oneshot"
 #
-# Serves assets only from cache, never contacts `jackbox.tv`
+# Serves assets only from the cache, never contacts `jackbox.tv`
 #
 # cache_mode = "offline"
 

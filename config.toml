@@ -33,6 +33,8 @@ path = "doodle_renders"
 [tts]
 # The path to your `piper` executable
 piper_bin = "piper-tts"
+# The path to your `ffmpeg` executable
+ffmpeg_bin = "ffmpeg"
 # The path to where the `piper` voices are located
 voices_path = "voices"
 # The path where generated TTS audio files are saved

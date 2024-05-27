@@ -57,7 +57,7 @@ server_url = "https://blobcast.jackboxgames.com"
 cert = "certs/192.168.1.10.pem"
 key = "certs/192.168.1.10-key.pem"
 
-# These are the ports that the Jackbox games will try to connect to
+# These defaults are the ports that the Jackbox games will try to connect to
 [ports]
 https = 443
 blobcast = 38203

@@ -29,6 +29,23 @@ render = true
 # Where doodles should be rendered
 path = "doodle_renders"
 
+# Used in Mad Verse City for generating rap battles
+[tts]
+# The path to your `piper` executable
+piper_bin = "piper-tts"
+# The path to where the `piper` voices are located
+voices_path = "voices"
+# The path where generated TTS audio files are saved
+tts_dir = "tts"
+#
+# Generate TTS using `piper`
+#
+op_mode = "native"
+#
+# Ask `blobcast.server_url` to generate the TTS audio
+#
+# op_mode = "proxy"
+
 [ecast]
 # Any connections that go through in proxy mode will be proxied to the `server_url`
 #

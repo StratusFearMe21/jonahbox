@@ -14,6 +14,7 @@ This project extends on the work of [InvoxiPlayGames](https://github.com/InvoxiP
 * The Jackbox Party Pack 3 (Audience manually disabled)
 * The Jackbox Party Pack 4 (Audience manually disabled)
 * The Jackbox Party Pack 5 (Audience manually disabled)
+    * Mad Verse City (Requires TTS to be set up)
 * The Jackbox Party Pack 6 (Audience manually disabled)
     * Not tested, but I can't imagine why it wouldn't work
 * The Jackbox Party Pack 7
@@ -53,6 +54,10 @@ cargo run --release
 ```
 
 Or look in [releases](releases) for a binary.
+
+### TTS
+
+Mad Verse City requires a tts endpoint in order to generate the audio for the raps. In native mode, this can be done using the [piper](https://github.com/rhasspy/piper) project. First set that up, then go [here](https://github.com/rhasspy/piper/blob/master/VOICES.md) and download the voices and their associated config files to the `voices_path` (Note that the expected name for config files is {voice}.onnx.json, and that it's not named that already). You will also need [ffmpeg](https://ffmpeg.org/) installed.
 
 ### Caching games
 

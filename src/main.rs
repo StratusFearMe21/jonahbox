@@ -39,7 +39,7 @@ use tokio::{
     signal,
     sync::{Mutex, Notify, RwLock},
 };
-use tower_http::trace::TraceLayer;
+use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tree_sitter::{Parser, QueryCursor};
 
@@ -146,6 +146,7 @@ struct Config {
     ecast: Ecast,
     blobcast: Ecast,
     tls: Tls,
+    tts: TTSConfig,
     ports: Ports,
     cache: CacheConfig,
     accessible_host: String,
@@ -167,6 +168,15 @@ struct Ecast {
 struct Tls {
     cert: PathBuf,
     key: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct TTSConfig {
+    piper_bin: PathBuf,
+    ffmpeg_bin: PathBuf,
+    voices_path: PathBuf,
+    tts_dir: PathBuf,
+    op_mode: OpMode,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -421,6 +431,10 @@ async fn main() -> anyhow::Result<()> {
             get(ecast::app_config_handler),
         )
         .route("/tts/generate", post(tts::generate_handler))
+        .route_service(
+            "/tts/*path",
+            ServeDir::new(state.config.tts.tts_dir.clone()),
+        )
         .route("/room", get(blobcast::rooms_handler))
         .route("/accessToken", post(blobcast::access_token_handler))
         .route("/socket.io/1", get(blobcast::load_handler))

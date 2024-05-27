@@ -21,7 +21,7 @@ helix-lsp = { git = "https://github.com/helix-editor/helix", rev = "2cadec0" }
 tokio = { version = "1.37.0", features = ["rt-multi-thread", "macros", "fs", "process", "signal"] }
 tokio-tungstenite = { version = "0.21.0", features = ["rustls-tls-native-roots"] }
 tokio-util = { version = "0.7.11", features = ["io"] }
-tower-http = { version = "0.5.2", features = ["trace"] }
+tower-http = { version = "0.5.2", features = ["trace", "fs"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tree-sitter = "0.22.6"
@@ -40,6 +40,7 @@ csscolorparser = { version = "0.6.2", features = ["serde"] }
 rand_xoshiro = "0.6.0"
 phf = "0.11.2"
 anyhow = "1.0.86"
+glob = "0.3.1"
 
 [profile.dev.package."*"]
 opt-level = 3

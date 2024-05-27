@@ -118,7 +118,6 @@ struct State {
     room_map: Arc<DashMap<String, Arc<Room>>>,
     http_cache: http_cache::HttpCache,
     config: Arc<Config>,
-    offline: bool,
 }
 
 #[derive(Deserialize)]
@@ -135,8 +134,8 @@ struct Config {
     blobcast: Ecast,
     tls: Tls,
     ports: Ports,
+    cache: CacheConfig,
     accessible_host: String,
-    cache_path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -162,6 +161,20 @@ struct Ports {
     https: u16,
     blobcast: u16,
     http: Option<u16>,
+}
+
+#[derive(Deserialize)]
+struct CacheConfig {
+    cache_path: PathBuf,
+    cache_mode: CacheMode,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheMode {
+    Online,
+    Oneshot,
+    Offline,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -348,7 +361,6 @@ async fn main() {
             }),
         },
         config: Arc::new(config),
-        offline: std::env::args().nth(1).is_some(),
     };
 
     tokio::fs::create_dir_all(&state.config.doodles.path)
@@ -430,9 +442,9 @@ async fn serve_jb_tv(
             .get_cached(
                 uri,
                 headers,
-                state.offline,
+                state.config.cache.cache_mode,
                 &state.config.accessible_host,
-                &state.config.cache_path,
+                &state.config.cache.cache_path,
             )
             .await;
         // Ok(().into_response())

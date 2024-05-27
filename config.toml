@@ -1,7 +1,25 @@
 # The host which your Jackbox games can access (through HTTPS)
 accessible_host = "192.168.1.10"
+
+# Controls how the HTTP cache for `jackbox.tv` functions
+[cache]
 # The path which cached `jackbox.tv` assets are stored
 cache_path = "jb_cache"
+# How the cache operates
+#
+# Serves assets from `jackbox.tv`, checks if they
+# have changed, and re-aquires them if so
+#
+cache_mode = "online"
+#
+# Serves assets from `jackbox.tv`, and only contacts 
+# the web if an asset is not already in the cache
+#
+# cache_mode = "oneshot"
+#
+# Serves assets only from cache, never contacts `jackbox.tv`
+#
+# cache_mode = "offline"
 
 # Allows pseudo post-game sharing by rendering completed doodles to a directory
 # Only works with games that use the doodle API.
@@ -13,9 +31,13 @@ path = "doodle_renders"
 
 [ecast]
 # Any connections that go through in proxy mode will be proxied to the `server_url`
+#
 op_mode = "proxy"
+#
 # Native mode means that all games are handled by *this* server implementation
+#
 # op_mode = "native"
+#
 # The jackbox server to proxy to, only matters if op_mode="proxy"
 server_url = "https://ecast.jackboxgames.com"
 # server_url = "http://192.168.1.10:8080"

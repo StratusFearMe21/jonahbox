@@ -26,6 +26,8 @@ use tokio::{io::AsyncBufReadExt, sync::Mutex};
 use tokio_util::io::StreamReader;
 use tree_sitter::QueryCursor;
 
+use crate::CacheMode;
+
 #[derive(Clone)]
 pub struct HttpCache {
     pub client: reqwest::Client,
@@ -83,7 +85,7 @@ impl HttpCache {
         &self,
         mut uri: uri::Uri,
         mut headers: HeaderMap,
-        offline: bool,
+        cache_mode: CacheMode,
         accessible_host: &str,
         cache_path: &Path,
     ) -> Result<Response, (StatusCode, String)> {
@@ -135,7 +137,7 @@ impl HttpCache {
                 uri.path()
             }
         ));
-        let mut reqwest_resp = if offline {
+        let mut reqwest_resp = if matches!(cache_mode, CacheMode::Offline | CacheMode::Oneshot) {
             None
         } else {
             Some(
@@ -184,11 +186,12 @@ impl HttpCache {
 
         if reqwest_resp
             .as_ref()
-            .is_some_and(|r| r.status() == StatusCode::NOT_MODIFIED)
+            .map(|r| r.status() == StatusCode::NOT_MODIFIED)
+            .unwrap_or(true)
             && !cached_resource.exists()
         {
             headers.remove(IF_NONE_MATCH);
-            reqwest_resp = if offline {
+            reqwest_resp = if matches!(cache_mode, CacheMode::Online) {
                 None
             } else {
                 Some(

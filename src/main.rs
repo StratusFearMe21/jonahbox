@@ -48,6 +48,7 @@ mod blobcast;
 mod ecast;
 mod entity;
 mod http_cache;
+mod tts;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Token([u8; 12]);
@@ -362,8 +363,8 @@ async fn main() -> anyhow::Result<()> {
 
     let config_file =
         std::fs::read_to_string("config.toml").context("Could not read config.toml")?;
-    let config: Config = toml::from_str(&config_file)
-        .with_context(|| format!("Failed to deserialize config.toml: {}", config_file))?;
+    let config: Config =
+        toml::from_str(&config_file).context("Failed to deserialize config.toml")?;
 
     let tls_config = RustlsConfig::from_pem_file(&config.tls.cert, &config.tls.key)
         .await
@@ -419,6 +420,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v2/app-configs/:app_tag",
             get(ecast::app_config_handler),
         )
+        .route("/tts/generate", post(tts::generate_handler))
         .route("/room", get(blobcast::rooms_handler))
         .route("/accessToken", post(blobcast::access_token_handler))
         .route("/socket.io/1", get(blobcast::load_handler))

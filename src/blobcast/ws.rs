@@ -408,8 +408,7 @@ async fn process_message(
             let connection = room
                 .connections
                 .iter()
-                .find(|c| c.profile.user_id == user_id)
-                .with_context(|| format!("No connection found for user_id: {}", user_id))?;
+                .find(|c| c.profile.user_id == user_id);
             let entity = {
                 let prev_value = room.entities.get(&key);
                 JBEntity(
@@ -436,19 +435,23 @@ async fn process_message(
                         locked: false.into(),
                         acl: vec![Acl {
                             interest: Interest::READABLE,
-                            principle: crate::acl::Principle::Id(*connection.key()),
+                            principle: crate::acl::Principle::Id(
+                                connection.as_ref().map(|c| *c.key()).unwrap_or_default(),
+                            ),
                         }],
                     },
                 )
             };
-            connection
-                .send_ecast(crate::ecast::ws::JBMessage {
-                    pc: 0,
-                    re: None,
-                    result: &JBResult::Object(&entity.1),
-                })
-                .await
-                .context("Failed to send customer blob to ecast client")?;
+            if let Some(connection) = connection {
+                connection
+                    .send_ecast(crate::ecast::ws::JBMessage {
+                        pc: 0,
+                        re: None,
+                        result: &JBResult::Object(&entity.1),
+                    })
+                    .await
+                    .context("Failed to send customer blob to ecast client")?;
+            }
             room.entities.insert(key, entity);
         }
         "LockRoom" => {

@@ -1,6 +1,6 @@
 # Johnbox
 
-A private server implementation in Rust for modern Jackbox Games services (Ecast / API v2).
+A private server implementation in Rust for modern Jackbox Games services.
 
 **This project is not related to or endorsed by Jackbox Games, Inc.**
 

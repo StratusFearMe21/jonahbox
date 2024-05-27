@@ -684,9 +684,14 @@ async fn process_message(
                 if doodle_config.render {
                     if let Some(JBValue::Doodle(ref d)) = entity.value().1.val {
                         let png_path = doodle_config.path.join(format!("{}.png", entity.key()));
-                        d.render().save_png(&png_path).with_context(|| {
-                            format!("Failed to render doodle to {}", png_path.display())
-                        })?;
+                        d.render()
+                            .with_context(|| {
+                                format!("Failed to render doodle to {}", png_path.display())
+                            })?
+                            .save_png(&png_path)
+                            .with_context(|| {
+                                format!("Failed to save doodle to {}", png_path.display())
+                            })?;
                     }
                 }
             }

@@ -6,17 +6,18 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, bail, Context};
 use axum::extract::{
     ws::{Message, WebSocket},
     Query,
 };
+use color_eyre::eyre::{self, bail, eyre, Context, OptionExt};
 use dashmap::DashMap;
 use futures_util::{stream::SplitStream, SinkExt, StreamExt, TryStreamExt};
 use serde::{de::IgnoredAny, ser::SerializeMap, Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tracing::instrument;
 
 use crate::{
     acl::{Acl, Role},
@@ -210,11 +211,12 @@ pub struct ClientConnected<'a> {
     profile: &'a JBProfile,
 }
 
+#[instrument]
 pub async fn connect_socket(
     socket: WebSocket,
     Query(url_query): Query<WSQuery>,
     room: Arc<Room>,
-) -> anyhow::Result<ConnectedSocket> {
+) -> eyre::Result<ConnectedSocket> {
     let (ws_write, ws_read) = socket.split();
 
     let (reconnected, client): (bool, Arc<Client>) = {
@@ -268,13 +270,14 @@ pub async fn connect_socket(
     })
 }
 
+#[instrument(skip_all, fields(role = ?client.profile.role, id = client.profile.id))]
 pub async fn handle_socket(
     client: Arc<Client>,
     room: Arc<Room>,
     reconnect: bool,
     mut ws_read: SplitStream<WebSocket>,
     doodle_config: &DoodleConfig,
-) -> anyhow::Result<()> {
+) -> eyre::Result<()> {
     client
         .send_ecast(JBMessage {
             pc: 0,
@@ -294,7 +297,7 @@ pub async fn handle_socket(
             }),
         })
         .await
-        .context("Failed to send ecast client/welcome to client")?;
+        .wrap_err("Failed to send ecast client/welcome to client")?;
 
     {
         if let Some(host) = room.connections.get(&1) {
@@ -319,7 +322,7 @@ pub async fn handle_socket(
                             }]),
                         })
                         .await
-                        .context("Failed to send blobcast CustomerJoinedRoom to host")?;
+                        .wrap_err("Failed to send blobcast CustomerJoinedRoom to host")?;
                 }
                 ClientType::Ecast => {
                     let client_connected = JBResult::ClientConnected(ClientConnected {
@@ -338,7 +341,7 @@ pub async fn handle_socket(
                             result: &client_connected,
                         })
                         .await
-                        .context("Failed to send ecast client/connected to host")?;
+                        .wrap_err("Failed to send ecast client/connected to host")?;
                 }
                 _ => {}
             }
@@ -351,7 +354,7 @@ pub async fn handle_socket(
                 match ws_message {
                     Some(Ok(ws_message)) => {
                         let message: WSMessage = match ws_message {
-                            Message::Text(ref t) => serde_json::from_str(t).with_context(|| format!("Failed to deserialize WSMessage: {}", t))?,
+                            Message::Text(ref t) => serde_json::from_str(t).wrap_err_with(|| format!("Failed to deserialize WSMessage: {}", t))?,
                             Message::Close(_) => break 'outer,
                             Message::Ping(d) => {
                                 client.pong(d).await?;
@@ -359,13 +362,11 @@ pub async fn handle_socket(
                             }
                             _ => continue,
                         };
-                        tracing::debug!(id = client.profile.id, role = ?client.profile.role, ?message, "Recieved WS Message");
                         process_message(&client, message, &room, doodle_config).await
-                            .context("Failed to process ecast message")?;
-                        tracing::debug!("Message Processed");
+                            .wrap_err("Failed to process ecast message")?;
                     }
                     Some(Err(e)) => {
-                        tracing::error!(id = client.profile.id, role = ?client.profile.role, ?e, "Error in receiving message");
+                        tracing::error!(?e, "Error in receiving message");
                     }
                     None => {
                         break
@@ -384,12 +385,13 @@ pub async fn handle_socket(
     Ok(())
 }
 
+#[instrument(skip(client, room, doodle_config))]
 async fn process_message(
     client: &Client,
     message: WSMessage,
     room: &Room,
     doodle_config: &DoodleConfig,
-) -> anyhow::Result<()> {
+) -> eyre::Result<()> {
     let jb_type = message.params.scope();
     match message.params {
         JBParams::TextCreate(params)
@@ -423,7 +425,7 @@ async fn process_message(
                 if !(has_been_created || is_unlocked || has_perms)
                     && client.profile.role != Role::Host
                 {
-                    tracing::error!(id = client.profile.id, role = ?client.profile.role, acl = ?prev_value.as_ref().map(|pv| pv.value().2.acl.as_slice()), has_been_created, is_unlocked, has_perms, "Returned to sender");
+                    tracing::error!(acl = ?prev_value.as_ref().map(|pv| pv.value().2.acl.as_slice()), has_been_created, is_unlocked, has_perms, "Returned to sender");
                     client
                         .send_ecast(JBMessage {
                             pc: 0,
@@ -431,7 +433,7 @@ async fn process_message(
                             result: &JBResult::Error("Permission denied"),
                         })
                         .await
-                        .context("Failed to send ecast error to client")?;
+                        .wrap_err("Failed to send ecast error to client")?;
 
                     return Ok(());
                 }
@@ -510,7 +512,7 @@ async fn process_message(
                         result: &value,
                     })
                     .await
-                    .context("Failed to send ecast client an entity")?;
+                    .wrap_err("Failed to send ecast client an entity")?;
             }
             room.entities.insert(params.key, entity);
             client
@@ -520,7 +522,9 @@ async fn process_message(
                     result: &JBResult::Ok {},
                 })
                 .await
-                .context("Failed to send the result of create/set/update opcode to ecast client")?;
+                .wrap_err(
+                    "Failed to send the result of create/set/update opcode to ecast client",
+                )?;
         }
         JBParams::DoodleStroke(params) => {
             if let Some(mut entity) = room.entities.get_mut(&params.key) {
@@ -549,7 +553,7 @@ async fn process_message(
                                 result: &line_value,
                             })
                             .await
-                            .context("Failed to send doodle/line to ecast client")?;
+                            .wrap_err("Failed to send doodle/line to ecast client")?;
                     }
                 }
                 if let Some(JBValue::Doodle(ref mut doodle)) = entity.value_mut().1.val {
@@ -563,7 +567,7 @@ async fn process_message(
                         result: &JBResult::Ok {},
                     })
                     .await
-                    .context("Failed to send ecast client the result of doodle/stroke opcode")?;
+                    .wrap_err("Failed to send ecast client the result of doodle/stroke opcode")?;
             }
         }
         JBParams::TextGet(params)
@@ -583,7 +587,7 @@ async fn process_message(
                         },
                     })
                     .await
-                    .context("Failed to send ecast client the requested entity")?;
+                    .wrap_err("Failed to send ecast client the requested entity")?;
             }
         }
         JBParams::ClientSend(params) => {
@@ -605,7 +609,7 @@ async fn process_message(
                             }]),
                         })
                         .await
-                        .context("Failed to send blobcast host a CustomerMessage")?;
+                        .wrap_err("Failed to send blobcast host a CustomerMessage")?;
                     }
                     ClientType::Ecast => {
                         con.send_ecast(JBMessage {
@@ -614,7 +618,7 @@ async fn process_message(
                             result: &JBResult::ClientSend(params),
                         })
                         .await
-                        .context("Failed to send ecast host a client/send")?;
+                        .wrap_err("Failed to send ecast host a client/send")?;
                     }
                 }
             }
@@ -625,7 +629,7 @@ async fn process_message(
                     result: &JBResult::Ok {},
                 })
                 .await
-                .context("Failed to send ecast client the result of client/send opcode")?;
+                .wrap_err("Failed to send ecast client the result of client/send opcode")?;
         }
         JBParams::RoomExit(_) => {
             client
@@ -635,12 +639,12 @@ async fn process_message(
                     result: &JBResult::Ok {},
                 })
                 .await
-                .context("Failed to notify ecast host of room closing")?;
+                .wrap_err("Failed to notify ecast host of room closing")?;
             for client in room.connections.iter() {
                 client
                     .close()
                     .await
-                    .context("Closing socket failed during ecast room/exit")?;
+                    .wrap_err("Closing socket failed during ecast room/exit")?;
             }
             room.exit.notify_waiters();
         }
@@ -678,18 +682,18 @@ async fn process_message(
                             result: &value,
                         })
                         .await
-                        .context("Failed to notify ecast client of locked entity")?;
+                        .wrap_err("Failed to notify ecast client of locked entity")?;
                 }
 
                 if doodle_config.render {
                     if let Some(JBValue::Doodle(ref d)) = entity.value().1.val {
                         let png_path = doodle_config.path.join(format!("{}.png", entity.key()));
                         d.render()
-                            .with_context(|| {
+                            .wrap_err_with(|| {
                                 format!("Failed to render doodle to {}", png_path.display())
                             })?
                             .save_png(&png_path)
-                            .with_context(|| {
+                            .wrap_err_with(|| {
                                 format!("Failed to save doodle to {}", png_path.display())
                             })?;
                     }
@@ -702,7 +706,7 @@ async fn process_message(
                     result: &JBResult::Ok {},
                 })
                 .await
-                .context("Failed to send ecast client the result of lock opcode")?;
+                .wrap_err("Failed to send ecast client the result of lock opcode")?;
         }
         JBParams::Drop(params) => {
             if room.entities.get(&params.key).is_some_and(|e| {
@@ -718,7 +722,7 @@ async fn process_message(
                     result: &JBResult::Ok {},
                 })
                 .await
-                .context("Failed to send ecast client the result of drop opcode")?;
+                .wrap_err("Failed to send ecast client the result of drop opcode")?;
         }
         JBParams::Other(_) => {
             client
@@ -728,7 +732,7 @@ async fn process_message(
                     result: &JBResult::Ok {},
                 })
                 .await
-                .context("Failed to send generic ok to ecast client")?;
+                .wrap_err("Failed to send generic ok to ecast client")?;
         }
     }
 
@@ -781,12 +785,12 @@ impl<'a> Serialize for GetHere<'a> {
     }
 }
 
+#[instrument(skip(socket))]
 pub async fn handle_socket_proxy(
     host: String,
     socket: WebSocket,
     ecast_req: String,
-) -> anyhow::Result<()> {
-    tracing::debug!(host = host, "proying to");
+) -> eyre::Result<()> {
     let mut ecast_req = ecast_req.into_client_request().unwrap();
     ecast_req
         .headers_mut()
@@ -798,41 +802,38 @@ pub async fn handle_socket_proxy(
     let (ecast_write, ecast_read) = ecast_connection.split();
 
     let local_to_ecast = local_read
-        .map_err(|e: axum::Error| anyhow!("local_to_ecast stream broken: {}", e))
+        .map_err(|e: axum::Error| eyre!("local_to_ecast stream broken: {}", e))
         .map(
-            move |m| -> Result<tokio_tungstenite::tungstenite::Message, anyhow::Error> {
-                let m = match m.context("local_to_ecast message failed to be received")? {
+            move |m| -> eyre::Result<tokio_tungstenite::tungstenite::Message> {
+                let m = match m.wrap_err("local_to_ecast message failed to be received")? {
                     axum::extract::ws::Message::Text(m) => {
-                        let mut sm = m.split(":::");
-                        let opcode = sm.next().unwrap();
-                        let json_message = sm.next();
+                        let json_message = Some(&m);
                         tracing::debug!(
                             role = ?Role::Host,
-                            opcode = opcode,
                             message = %{
-                                json_message.map(|m| -> anyhow::Result<String> {
+                                json_message.map(|m| -> eyre::Result<String> {
                                     if let Ok(jq) = std::process::Command::new("jq")
                                         .stdin(Stdio::piped())
                                         .stdout(Stdio::piped())
                                         .arg("-C")
                                         .spawn() {
-                                            let mut jq_in = jq.stdin.context("jq process has no stdin")?;
-                                            let mut jq_out = jq.stdout.context("jq process has no stdout")?;
+                                            let mut jq_in = jq.stdin.ok_or_eyre("jq process has no stdin")?;
+                                            let mut jq_out = jq.stdout.ok_or_eyre("jq process has no stdout")?;
                                             jq_in.write_all(m.as_bytes())
-                                                .context("Failed to write to jq process")?;
+                                                .wrap_err("Failed to write to jq process")?;
                                             jq_in.write_all(b"\n")
-                                                .context("Failed to write to jq process")?;
+                                                .wrap_err("Failed to write to jq process")?;
                                             drop(jq_in);
                                             let mut jm = String::new();
                                             jq_out.read_to_string(&mut jm)
-                                                .context("Failed to read from jq process")?;
+                                                .wrap_err("Failed to read from jq process")?;
                                             Ok(jm)
                                         } else {
                                             Ok(m.to_owned())
                                         }
                                 })
                                 .unwrap_or_else(|| Ok(String::new()))
-                                .with_context(|| format!("jq coloration failed for message: {:?}", json_message))?
+                                .wrap_err_with(|| format!("jq coloration failed for message: {:?}", json_message))?
                             },
                             "to ecast",
                         );
@@ -864,45 +865,42 @@ pub async fn handle_socket_proxy(
                 m
             },
         )
-        .forward(ecast_write.sink_map_err(|e| anyhow!(e)));
+        .forward(ecast_write.sink_map_err(|e| eyre!(e)));
 
     let ecast_to_local = ecast_read
         .map_err(|e: tokio_tungstenite::tungstenite::Error| {
-            anyhow!("ecast_to_local stream broken: {}", e)
+            eyre!("ecast_to_local stream broken: {}", e)
         })
-        .map(|m| -> Result<axum::extract::ws::Message, anyhow::Error> {
-            let m = match m.context("ecast_to_local message failed to be received")? {
+        .map(|m| -> eyre::Result<axum::extract::ws::Message> {
+            let m = match m.wrap_err("ecast_to_local message failed to be received")? {
                 tokio_tungstenite::tungstenite::Message::Text(m) => {
-                    let mut sm = m.split(":::");
-                    let opcode = sm.next().unwrap();
-                    let json_message = sm.next();
+                    let json_message = Some(&m);
                     tracing::debug!(
                         role = ?Role::Host,
-                        opcode = opcode,
                         message = %{
-                            json_message.map(|m| -> anyhow::Result<String> {
+                            json_message.map(|m| -> eyre::Result<String> {
                                 if let Ok(jq) = std::process::Command::new("jq")
                                     .stdin(Stdio::piped())
                                     .stdout(Stdio::piped())
                                     .arg("-C")
                                     .spawn() {
-                                        let mut jq_in = jq.stdin.context("jq process has no stdin")?;
-                                        let mut jq_out = jq.stdout.context("jq process has no stdout")?;
+                                        let mut jq_in = jq.stdin.ok_or_eyre("jq process has no stdin")?;
+                                        let mut jq_out = jq.stdout.ok_or_eyre("jq process has no stdout")?;
                                         jq_in.write_all(m.as_bytes())
-                                            .context("Failed to write to jq process")?;
+                                            .wrap_err("Failed to write to jq process")?;
                                         jq_in.write_all(b"\n")
-                                            .context("Failed to write to jq process")?;
+                                            .wrap_err("Failed to write to jq process")?;
                                         drop(jq_in);
                                         let mut jm = String::new();
                                         jq_out.read_to_string(&mut jm)
-                                            .context("Failed to read from jq process")?;
+                                            .wrap_err("Failed to read from jq process")?;
                                         Ok(jm)
                                     } else {
                                         Ok(m.to_owned())
                                     }
                             })
                             .unwrap_or_else(|| Ok(String::new()))
-                            .with_context(|| format!("jq coloration failed for message: {:?}", json_message))?
+                            .wrap_err_with(|| format!("jq coloration failed for message: {:?}", json_message))?
                         },
                         "ecast to",
                     );
@@ -934,7 +932,7 @@ pub async fn handle_socket_proxy(
             );
             m
         })
-        .forward(local_write.sink_map_err(|e| anyhow!(e)));
+        .forward(local_write.sink_map_err(|e| eyre!(e)));
 
     tokio::pin!(local_to_ecast, ecast_to_local);
 

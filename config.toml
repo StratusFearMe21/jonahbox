@@ -10,7 +10,7 @@ cache_path = "jb_cache"
 # Serves assets from `jackbox.tv`, checks if they
 # have changed, and re-aquires them if so
 #
-cache_mode = "online"
+# cache_mode = "online"
 #
 # Serves assets from `jackbox.tv`, and only contacts 
 # the web if an asset is not already in the cache
@@ -19,7 +19,7 @@ cache_mode = "online"
 #
 # Serves assets only from the cache, never contacts `jackbox.tv`
 #
-# cache_mode = "offline"
+cache_mode = "offline"
 
 # Allows pseudo post-game sharing by rendering completed doodles to a directory
 # Only works with games that use the doodle API.
@@ -58,8 +58,8 @@ op_mode = "native"
 op_mode = "native"
 #
 # The jackbox server to proxy to, only matters if op_mode="proxy"
-server_url = "https://ecast.jackboxgames.com"
-# server_url = "http://192.168.1.10:8080"
+# server_url = "https://ecast.jackboxgames.com"
+server_url = "http://192.168.1.10:8888"
 
 # Same situation as the ecast configuration, but for the older API
 [blobcast]

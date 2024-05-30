@@ -39,8 +39,10 @@ tiny-skia = "0.11.4"
 csscolorparser = { version = "0.6.2", features = ["serde"] }
 rand_xoshiro = "0.6.0"
 phf = "0.11.2"
-anyhow = "1.0.86"
 glob = "0.3.1"
+ansi-to-html = { version = "0.2.1", features = ["lazy-init"] }
+color-eyre = "0.6.3"
+tracing-error = "0.2.0"
 
 [profile.dev.package."*"]
 opt-level = 3

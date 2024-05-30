@@ -5,12 +5,18 @@ use std::{
 };
 
 use axum::Json;
+use color_eyre::eyre::{eyre, Context, OptionExt};
 use nanoid::nanoid;
 use rand::{seq::IteratorRandom, SeedableRng};
 use rand_xoshiro::Xoroshiro128PlusPlus;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
-use crate::{OpMode, State};
+use crate::{
+    error::{PropogateRequest, WithStatusCode},
+    OpMode, State,
+};
 
 #[derive(Deserialize, Serialize)]
 pub struct TTSResponse {
@@ -30,12 +36,13 @@ pub struct TTSRequest {
     voice: String,
 }
 
+#[instrument(skip(state))]
 pub async fn generate_handler(
     axum::extract::State(state): axum::extract::State<State>,
     Json(tts): Json<TTSRequest>,
-) -> Json<TTSResponse> {
+) -> crate::error::Result<Json<TTSResponse>> {
     match state.config.tts.op_mode {
-        OpMode::Proxy => Json(
+        OpMode::Proxy => Ok(Json(
             state
                 .http_cache
                 .client
@@ -43,34 +50,61 @@ pub async fn generate_handler(
                 .json(&tts)
                 .send()
                 .await
-                .unwrap()
+                .wrap_err("Failed to request TTS from blobcast")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
+                .propogate_request_if_err()?
                 .json()
                 .await
-                .unwrap(),
-        ),
+                .wrap_err("Failed to convert to TTS response from JSON")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
+        )),
         OpMode::Native => {
             let mut hasher = DefaultHasher::default();
             hasher.write(tts.voice.as_bytes());
             let mut rng = Xoroshiro128PlusPlus::seed_from_u64(hasher.finish());
 
-            let voice = glob::glob(&format!(
-                "{}/*.onnx",
-                &state.config.tts.voices_path.display()
-            ))
-            .unwrap()
-            .choose(&mut rng)
-            .unwrap()
-            .unwrap();
+            let voice_glob = format!("{}/*.onnx", &state.config.tts.voices_path.display());
+            let voice = glob::glob(&voice_glob)
+                .wrap_err_with(|| format!("Failed to parse glob from voices path: {}", voice_glob))
+                .with_status_code(StatusCode::UNPROCESSABLE_ENTITY)?
+                .choose(&mut rng)
+                .ok_or_else(|| eyre!("Failed to find a voice from glob: {}", voice_glob))
+                .with_status_code(StatusCode::NOT_FOUND)?
+                .wrap_err_with(|| {
+                    format!(
+                        "Path grabbed from random choice from glob was not valid: {}",
+                        voice_glob
+                    )
+                })
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            let length_scale = 100.0 / tts.rate.trim_matches('%').parse::<f32>().unwrap();
+            let length_scale = 100.0
+                / tts
+                    .rate
+                    .trim_matches('%')
+                    .parse::<f32>()
+                    .wrap_err_with(|| {
+                        format!(
+                            "`{}` is not a valid floating point number",
+                            tts.rate.trim_matches('%')
+                        )
+                    })
+                    .with_status_code(StatusCode::UNPROCESSABLE_ENTITY)?;
             let out_name = format!("{}.{}", nanoid!(), tts.file_format);
             let out = state.config.tts.tts_dir.join(format!("tts/{}", out_name));
 
-            tokio::fs::create_dir_all(out.parent().unwrap())
+            let out_dir = out
+                .parent()
+                .ok_or_else(|| eyre!("The file `{}` has no parent", out.display()))
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
+            tokio::fs::create_dir_all(out_dir)
                 .await
-                .unwrap();
+                .wrap_err_with(|| {
+                    format!("The directory `{}` could not be created", out_dir.display())
+                })
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            tracing::debug!(?tts, voice = %voice.display(), out = %out.display(), "Generating TTS");
+            tracing::debug!(voice = %voice.display(), out = %out.display(), "Generating TTS");
             let mut piper = std::process::Command::new(state.config.tts.piper_bin.as_path())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -82,9 +116,18 @@ pub async fn generate_handler(
                     "--output-raw",
                 ])
                 .spawn()
-                .unwrap();
+                .wrap_err_with(|| {
+                    format!("Could not spawn `{}`", state.config.tts.piper_bin.display())
+                })
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
             let mut ffmpeg = std::process::Command::new(state.config.tts.ffmpeg_bin.as_path())
-                .stdin(piper.stdout.take().unwrap())
+                .stdin(
+                    piper
+                        .stdout
+                        .take()
+                        .ok_or_eyre("piper has no stdout")
+                        .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
+                )
                 .args([
                     "-f",
                     "s16le",
@@ -99,21 +142,31 @@ pub async fn generate_handler(
                     &out.display().to_string(),
                 ])
                 .spawn()
-                .unwrap();
+                .wrap_err_with(|| {
+                    format!(
+                        "Could not spawn `{}`",
+                        state.config.tts.ffmpeg_bin.display()
+                    )
+                })
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
             piper
                 .stdin
                 .take()
-                .unwrap()
+                .ok_or_eyre("piper has no stdin")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
                 .write_all(tts.text.as_bytes())
                 .unwrap();
 
-            ffmpeg.wait().unwrap();
+            ffmpeg
+                .wait()
+                .wrap_err("ffmpeg command failed")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            Json(TTSResponse {
+            Ok(Json(TTSResponse {
                 success: true,
                 url: format!("https://{}/tts/{}", state.config.accessible_host, out_name),
-            })
+            }))
         }
     }
 }

@@ -1,18 +1,23 @@
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
-use anyhow::Context;
 use axum::{
     extract::{Path, Query, WebSocketUpgrade},
     response::Response,
     Json,
 };
+use color_eyre::eyre::{eyre, Context};
 use dashmap::DashMap;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Notify;
+use tracing::instrument;
 
-use crate::{acl::Role, JBRoom, OpMode, State, Token};
+use crate::{
+    acl::Role,
+    error::{PropogateRequest, WithStatusCode},
+    JBRoom, OpMode, State, Token,
+};
 
 pub mod ws;
 
@@ -114,7 +119,7 @@ pub async fn play_handler(
         let config = Arc::clone(&state.config);
         Ok(ws.protocols(["ecast-v0"])
             .on_upgrade(move |socket| async move {
-                match ws::connect_socket(socket, url_query, room).await.context("Failed to connect ecast client") {
+                match ws::connect_socket(socket, url_query, room).await.wrap_err("Failed to connect ecast client") {
                     Err(e) => {
                         tracing::error!(%e);
                         return;
@@ -134,10 +139,11 @@ pub async fn play_handler(
     }
 }
 
+#[instrument(skip(state))]
 pub async fn rooms_handler(
     axum::extract::State(state): axum::extract::State<State>,
     Json(room_req): Json<RoomRequest>,
-) -> Json<JBResponse<RoomResponse>> {
+) -> crate::error::Result<Json<JBResponse<RoomResponse>>> {
     let code;
     let token;
     let host;
@@ -161,10 +167,13 @@ pub async fn rooms_handler(
                 .json(&room_req)
                 .send()
                 .await
-                .unwrap()
+                .wrap_err("Request for room failed")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
+                .propogate_request_if_err()?
                 .json()
                 .await
-                .unwrap();
+                .wrap_err("Failed to convert to result of room request from JSON")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
             tracing::debug!(
                 url = url,
@@ -175,10 +184,10 @@ pub async fn rooms_handler(
             match response.body {
                 JBResponseBody::Body(body) => {
                     code = body.code;
-                    token = body.token.parse().unwrap();
+                    token = body.token;
                     host = body.host;
                 }
-                JBResponseBody::Error(_) => return Json(response),
+                JBResponseBody::Error(_) => return Ok(Json(response)),
             }
         }
         OpMode::Native => {
@@ -187,6 +196,8 @@ pub async fn rooms_handler(
             host = state.config.accessible_host.to_owned();
         }
     }
+
+    tracing::debug!(code, token, host, "Creating room");
 
     state.room_map.insert(
         code.clone(),
@@ -213,40 +224,32 @@ pub async fn rooms_handler(
         }),
     );
 
-    Json(JBResponse {
+    Ok(Json(JBResponse {
         ok: true,
         body: JBResponseBody::Body(RoomResponse {
             host: state.config.accessible_host.clone(),
             code,
             token,
         }),
-    })
+    }))
 }
 
+#[instrument(skip(state))]
 pub async fn rooms_get_handler(
     axum::extract::State(state): axum::extract::State<State>,
     Path(code): Path<String>,
-) -> (StatusCode, Json<JBResponse<JBRoom>>) {
+) -> crate::error::Result<Json<JBResponse<JBRoom>>> {
     match state.config.ecast.op_mode {
         OpMode::Native => {
             let room = state.room_map.get(&code);
 
             if let Some(room) = room {
-                return (
-                    StatusCode::OK,
-                    Json(JBResponse {
-                        ok: true,
-                        body: JBResponseBody::Body(room.value().room_config.clone()),
-                    }),
-                );
+                return Ok(Json(JBResponse {
+                    ok: true,
+                    body: JBResponseBody::Body(room.value().room_config.clone()),
+                }));
             } else {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(JBResponse {
-                        ok: false,
-                        body: JBResponseBody::Error(Cow::Borrowed("no such room")),
-                    }),
-                );
+                return Err(eyre!("no such room")).with_status_code(StatusCode::NOT_FOUND);
             }
         }
         OpMode::Proxy => {
@@ -261,9 +264,21 @@ pub async fn rooms_get_handler(
                     .unwrap_or("https://ecast.jackboxgames.com"),
                 code
             );
-            let response = state.http_cache.client.get(&url).send().await.unwrap();
+            let response = state
+                .http_cache
+                .client
+                .get(&url)
+                .send()
+                .await
+                .wrap_err_with(|| format!("Failed to request room from {}", url))
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
+                .propogate_request_if_err()?;
             let status_code = response.status();
-            let mut response: JBResponse<JBRoom> = response.json().await.unwrap();
+            let mut response: JBResponse<JBRoom> = response
+                .json()
+                .await
+                .wrap_err("Failed to deserialize room to JSON")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
             tracing::debug!(url, ?status_code, ?response, "ecast request");
 
@@ -275,26 +290,27 @@ pub async fn rooms_get_handler(
                 _ => {}
             }
 
-            (status_code, Json(response))
+            Ok(Json(response))
         }
     }
 }
 
+#[instrument(skip(state))]
 pub async fn app_config_handler(
     Path(code): Path<String>,
     Query(query): Query<HashMap<String, String>>,
     axum::extract::State(state): axum::extract::State<State>,
-) -> Json<JBResponse<serde_json::Value>> {
+) -> crate::error::Result<Json<JBResponse<serde_json::Value>>> {
     match state.config.ecast.op_mode {
         OpMode::Native => {
-            return Json(JBResponse {
+            return Ok(Json(JBResponse {
                 ok: true,
                 body: JBResponseBody::Body(json!({
                     "settings": {
                         "serverUrl": state.config.accessible_host.clone()
                     }
                 })),
-            });
+            }));
         }
         OpMode::Proxy => {
             let url = format!(
@@ -315,10 +331,13 @@ pub async fn app_config_handler(
                 .get(&url)
                 .send()
                 .await
-                .unwrap()
+                .wrap_err("Failed to get app config")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
+                .propogate_request_if_err()?
                 .json()
                 .await
-                .unwrap();
+                .wrap_err("Failed to deserialize app config to JSON")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
             tracing::debug!(
                 url = url,
@@ -326,7 +345,7 @@ pub async fn app_config_handler(
                 "ecast request"
             );
 
-            Json(response)
+            Ok(Json(response))
         }
     }
 }

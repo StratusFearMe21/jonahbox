@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicI64},
 };
 
-use anyhow::Context;
+use color_eyre::eyre::{self, ContextCompat};
 use serde::{Deserialize, Serialize};
 use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use tokio::io::Interest;
@@ -127,9 +127,9 @@ pub struct JBDoodle {
 }
 
 impl JBDoodle {
-    pub fn render(&self) -> anyhow::Result<Pixmap> {
+    pub fn render(&self) -> eyre::Result<Pixmap> {
         let mut layers = vec![
-            Pixmap::new(self.size.width, self.size.height).with_context(
+            Pixmap::new(self.size.width, self.size.height).wrap_err_with(
                 || format!("Failed to create Pixmap of size {:?}", self.size)
             )?;
             self.max_layer.max(1)

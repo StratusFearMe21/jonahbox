@@ -1,16 +1,21 @@
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
-use anyhow::Context;
 use axum::{
     extract::{Path, Query, WebSocketUpgrade},
     response::IntoResponse,
     Json,
 };
+use color_eyre::eyre::Context;
 use dashmap::DashMap;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
+use tracing::instrument;
 
-use crate::{OpMode, State, Token};
+use crate::{
+    error::{PropogateRequest, WithStatusCode},
+    OpMode, State, Token,
+};
 
 pub mod ws;
 
@@ -39,7 +44,7 @@ pub const APP_TAGS: phf::Map<&'static str, &'static str> = phf::phf_map! {
     "c72415bb-762a-df24-10f1-62dd419342a2" => "slingshoot",
 };
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct BlobcastWSQuery {
     t: u64,
 }
@@ -75,7 +80,7 @@ pub async fn play_handler(
         let room_map = Arc::clone(&state.room_map);
         ws
             .on_upgrade(move |socket| async move {
-                match ws::connect_socket(socket, Arc::clone(&room_map), state.config.accessible_host.clone()).await.context("Failed to connect blobcast socket") {
+                match ws::connect_socket(socket, Arc::clone(&room_map), state.config.accessible_host.clone()).await.wrap_err("Failed to connect blobcast socket") {
                     Err(e) => {
                         tracing::error!(%e);
                         return;
@@ -98,10 +103,11 @@ pub async fn play_handler(
     }
 }
 
+#[instrument(skip(state))]
 pub async fn load_handler(
     axum::extract::State(state): axum::extract::State<State>,
     url_query: Query<BlobcastWSQuery>,
-) -> String {
+) -> crate::error::Result<String> {
     match state.config.blobcast.op_mode {
         OpMode::Proxy => {
             let url = format!(
@@ -116,10 +122,13 @@ pub async fn load_handler(
                 .get(&url)
                 .send()
                 .await
-                .unwrap()
+                .wrap_err("Failed to contact blobcast server to load room")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
+                .propogate_request_if_err()?
                 .text()
                 .await
-                .unwrap();
+                .wrap_err("Failed to convert response of blobcast load to String")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
             tracing::debug!(
                 url = url,
@@ -127,18 +136,19 @@ pub async fn load_handler(
                 "blobcast request"
             );
 
-            response
+            Ok(response)
         }
-        OpMode::Native => format!(
-            "{:x}:60:60:websocket", // We are not compatible with flashsocket, excluding it just to be safe
+        OpMode::Native => Ok(format!(
+            "{:x}:60:60:websocket",
             Token::from_seed(url_query.t)
-        ),
+        )),
     }
 }
 
+#[instrument(skip_all)]
 pub async fn rooms_handler(
     axum::extract::State(state): axum::extract::State<State>,
-) -> Json<BlobcastRoomResponse> {
+) -> crate::error::Result<Json<BlobcastRoomResponse>> {
     let f_url;
     let response = match state.config.blobcast.op_mode {
         OpMode::Proxy => {
@@ -159,10 +169,13 @@ pub async fn rooms_handler(
                 .get(&url)
                 .send()
                 .await
-                .unwrap()
+                .wrap_err("Failed to create blobcast room")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
+                .propogate_request_if_err()?
                 .json()
                 .await
-                .unwrap();
+                .wrap_err("Failed to convert to blobcast room response from JSON")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
             *state.blobcast_host.write().await = response.server.clone();
 
@@ -193,7 +206,7 @@ pub async fn rooms_handler(
         "blobcast request"
     );
 
-    Json(response)
+    Ok(Json(response))
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -211,10 +224,11 @@ pub struct AccessTokenResponse {
     success: bool,
 }
 
+#[instrument(skip(state))]
 pub async fn access_token_handler(
     axum::extract::State(state): axum::extract::State<State>,
     Json(token_req): Json<AccessTokenRequest>,
-) -> Json<AccessTokenResponse> {
+) -> crate::error::Result<Json<AccessTokenResponse>> {
     let response = match state.config.blobcast.op_mode {
         OpMode::Proxy => {
             let url = format!(
@@ -235,13 +249,15 @@ pub async fn access_token_handler(
                 .json(&token_req)
                 .send()
                 .await
-                .unwrap()
+                .wrap_err("Failed to acquire access token")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
+                .propogate_request_if_err()?
                 .json()
                 .await
-                .unwrap();
+                .wrap_err("Failed to decode access token response from JSON")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
             tracing::debug!(
-                req = ?token_req,
                 url = url,
                 response = ?response,
                 "blobcast request"
@@ -280,5 +296,5 @@ pub async fn access_token_handler(
         },
     };
 
-    return Json(response);
+    return Ok(Json(response));
 }

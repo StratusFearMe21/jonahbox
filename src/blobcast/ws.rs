@@ -14,8 +14,8 @@ use crate::{
     Client, ClientType, ConnectedSocket, JBProfile, Room, Token,
 };
 
-use anyhow::{anyhow, bail, Context};
 use axum::extract::ws::{Message, WebSocket};
+use color_eyre::eyre::{self, bail, eyre, OptionExt, WrapErr};
 use dashmap::DashMap;
 use futures_util::{stream::SplitStream, SinkExt, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,7 @@ use tokio::{
     sync::{Mutex, Notify},
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tracing::instrument;
 
 #[derive(Debug)]
 struct WSMessage<'a> {
@@ -32,22 +33,22 @@ struct WSMessage<'a> {
 }
 
 impl<'a> FromStr for WSMessage<'a> {
-    type Err = anyhow::Error;
+    type Err = eyre::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s
             .split_once("::")
-            .ok_or_else(|| anyhow!("Failed to split socket.io message: {}", s))?;
+            .ok_or_else(|| eyre!("Failed to split socket.io message: {}", s))?;
         let opcode: u8 =
             s.0.parse()
-                .with_context(|| format!("Opcode is not a valid number: {}", s.0))?;
+                .wrap_err_with(|| format!("Opcode is not a valid number: {}", s.0))?;
         let message: Option<JBMessage> = if opcode == 5 {
             let message =
                 s.1.get(1..)
-                    .with_context(|| format!("Opcode 5 contains no message: {}", s.1))?;
+                    .ok_or_else(|| eyre!("Opcode 5 contains no message: {}", s.1))?;
             Some(
                 serde_json::from_str(&message)
-                    .with_context(|| format!("Failed to deserialize message: {}", message))?,
+                    .wrap_err_with(|| format!("Failed to deserialize message: {}", message))?,
             )
         } else {
             None
@@ -133,23 +134,24 @@ pub struct JBArgs<'a> {
     pub success: Option<bool>,
 }
 
+#[instrument(skip(room_map))]
 pub async fn connect_socket(
     socket: WebSocket,
     room_map: Arc<DashMap<String, Arc<Room>>>,
     host: String,
-) -> anyhow::Result<ConnectedSocket> {
+) -> eyre::Result<ConnectedSocket> {
     let (mut ws_write, mut ws_read) = socket.split();
 
     ws_write
         .send(Message::Text("1::".to_owned()))
         .await
-        .context("Failed to send blobcast connection message: ::1")?;
+        .wrap_err("Failed to send blobcast connection message: ::1")?;
 
     let create_room_msg = ws_read
         .next()
         .await
-        .context("Failed to receive CreateRoom message")?
-        .context("CreateRoom message is a None")?;
+        .ok_or_eyre("Failed to receive CreateRoom message")?
+        .wrap_err("CreateRoom message is a None")?;
 
     let Message::Text(create_room) = create_room_msg else {
         bail!(
@@ -158,7 +160,7 @@ pub async fn connect_socket(
         );
     };
 
-    let create_room = WSMessage::from_str(&create_room).with_context(|| {
+    let create_room = WSMessage::from_str(&create_room).wrap_err_with(|| {
         format!(
             "Failed to deserialize CreateRoom WS Message: {}",
             create_room
@@ -176,7 +178,7 @@ pub async fn connect_socket(
                 let app_id = create_room
                     .message
                     .as_ref()
-                    .with_context(|| format!("CreateRoom contained no message: {:?}", create_room))?
+                    .ok_or_else(|| eyre!("CreateRoom contained no message: {:?}", create_room))?
                     .args
                     .get_args()
                     .app_id
@@ -193,7 +195,7 @@ pub async fn connect_socket(
             app_id: create_room
                 .message
                 .as_ref()
-                .with_context(|| format!("CreateRoom contained no message: {:?}", create_room))?
+                .ok_or_else(|| eyre!("CreateRoom contained no message: {:?}", create_room))?
                 .args
                 .get_args()
                 .app_id
@@ -231,7 +233,7 @@ pub async fn connect_socket(
             room_code
         )))
         .await
-        .context("Failed to send result of CreateRoom")?;
+        .wrap_err("Failed to send result of CreateRoom")?;
 
     let serial = room
         .room_serial
@@ -243,7 +245,7 @@ pub async fn connect_socket(
         user_id: create_room
             .message
             .as_ref()
-            .with_context(|| format!("CreateRoom contained no message: {:?}", create_room))?
+            .ok_or_else(|| eyre!("CreateRoom contained no message: {:?}", create_room))?
             .args
             .get_args()
             .user_id
@@ -269,11 +271,12 @@ pub async fn connect_socket(
     })
 }
 
+#[instrument(skip_all, fields(role = ?client.profile.role, id = client.profile.id))]
 pub async fn handle_socket(
     mut ws_read: SplitStream<WebSocket>,
     room: Arc<Room>,
     client: Arc<Client>,
-) -> anyhow::Result<()> {
+) -> eyre::Result<()> {
     'outer: loop {
         tokio::select! {
             ws_message = ws_read.next() => {
@@ -281,7 +284,7 @@ pub async fn handle_socket(
                     Some(Ok(ws_message)) => {
                         let message: WSMessage = match ws_message {
                             Message::Text(ref t) => WSMessage::from_str(t)
-                                .with_context(|| format!("Failed to deserialize message: {}", t))?,
+                                .wrap_err_with(|| format!("Failed to deserialize message: {}", t))?,
                             Message::Close(_) => break 'outer,
                             Message::Ping(d) => {
                                 client.pong(d).await?;
@@ -289,15 +292,13 @@ pub async fn handle_socket(
                             }
                             _ => continue,
                         };
-                        tracing::debug!(id = client.profile.id, role = ?client.profile.role, ?message, "Recieved WS Message");
                         if let Some(ref message) = message.message {
                             process_message(&client, message, &room).await
-                                .with_context(|| format!("Failed to process message: {:?}", message))?;
+                                .wrap_err("Failed to process message")?;
                         }
-                        tracing::debug!("Message Processed");
                     }
                     Some(Err(e)) => {
-                        tracing::error!(id = client.profile.id, role = ?client.profile.role, ?e, "Error in receiving message");
+                        tracing::error!(?e, "Error in receiving message");
                     }
                     None => {
                         break
@@ -306,7 +307,7 @@ pub async fn handle_socket(
             }
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 client.send_ws_message(Message::Text(String::from("2:::"))).await
-                    .context("Failed to send blobcast ping to client")?;
+                    .wrap_err("Failed to send blobcast ping to client")?;
             }
             _ = room.exit.notified() => {
                 break
@@ -317,11 +318,12 @@ pub async fn handle_socket(
     Ok(())
 }
 
+#[instrument(skip(client, room))]
 async fn process_message(
     client: &Client,
     message: &JBMessage<'_>,
     room: &Room,
-) -> anyhow::Result<()> {
+) -> eyre::Result<()> {
     match message.args.get_args().action.as_ref() {
         "SetRoomBlob" => {
             let entity = {
@@ -337,7 +339,7 @@ async fn process_message(
                                 .blob
                                 .as_object()
                                 .cloned()
-                                .context("No blob in SetRoomBlob message")?,
+                                .ok_or_eyre("No blob in SetRoomBlob message")?,
                         )),
                         restrictions: JBRestrictions::default(),
                         version: prev_value
@@ -363,7 +365,7 @@ async fn process_message(
                                 result: &value,
                             })
                             .await
-                            .context("Failed to send room blob to ecast client")?;
+                            .wrap_err("Failed to send room blob to ecast client")?;
                     }
                     ClientType::Blobcast => {
                         client
@@ -373,18 +375,19 @@ async fn process_message(
                                     arg_type: Cow::Borrowed("Event"),
                                     action: Cow::Borrowed("RoomBlobChanged"),
                                     room_id: Cow::Borrowed(&room.room_config.code),
-                                    blob: serde_json::to_value(&entity.1.val).with_context(
+                                    blob: serde_json::to_value(&entity.1.val).wrap_err_with(
                                         || {
                                             format!(
-                                                "Failed to convert entity to serde_json::Value: {:?}",
-                                                entity.1.val
-                                            )
+                                            "Failed to convert entity to serde_json::Value: {:?}",
+                                            entity.1.val
+                                        )
                                         },
                                     )?,
                                     ..Default::default()
                                 }]),
                             })
-                            .await.context("Failed to ACK RoomBlob to blobcast host")?;
+                            .await
+                            .wrap_err("Failed to ACK RoomBlob to blobcast host")?;
                     }
                 }
             }
@@ -400,7 +403,7 @@ async fn process_message(
                     }]),
                 })
                 .await
-                .context("Failed to send result of SetRoomBlob")?;
+                .wrap_err("Failed to send result of SetRoomBlob")?;
         }
         "SetCustomerBlob" => {
             let user_id = message.args.get_args().customer_user_id.as_ref();
@@ -422,7 +425,7 @@ async fn process_message(
                                 .blob
                                 .as_object()
                                 .cloned()
-                                .context("No blob in SetCustomerBlob message")?,
+                                .ok_or_eyre("No blob in SetCustomerBlob message")?,
                         )),
                         restrictions: JBRestrictions::default(),
                         version: prev_value
@@ -450,7 +453,7 @@ async fn process_message(
                         result: &JBResult::Object(&entity.1),
                     })
                     .await
-                    .context("Failed to send customer blob to ecast client")?;
+                    .wrap_err("Failed to send customer blob to ecast client")?;
             }
             room.entities.insert(key, entity);
         }
@@ -467,7 +470,7 @@ async fn process_message(
                     }]),
                 })
                 .await
-                .context("Failed to send result of LockRoom to blobcast host")?;
+                .wrap_err("Failed to send result of LockRoom to blobcast host")?;
         }
         a => bail!("Unimplemented blobcast action {:?}", a),
     }
@@ -475,28 +478,28 @@ async fn process_message(
     Ok(())
 }
 
+#[instrument(skip(socket))]
 pub async fn handle_socket_proxy(
     host: String,
     socket: WebSocket,
     blobcast_req: String,
-) -> anyhow::Result<()> {
-    tracing::debug!(host = host, "proying blobcast to");
+) -> eyre::Result<()> {
     let blobcast_req = blobcast_req
         .into_client_request()
-        .context("blobcast_req could not be converted to a client request")?;
+        .wrap_err("blobcast_req could not be converted to a client request")?;
     let (blobcast_connection, _) = tokio_tungstenite::connect_async(blobcast_req)
         .await
-        .context("Failed to connect to blobcast proxy")?;
+        .wrap_err("Failed to connect to blobcast proxy")?;
 
     let (local_write, local_read) = socket.split();
 
     let (blobcast_write, blobcast_read) = blobcast_connection.split();
 
     let local_to_blobcast = local_read
-        .map_err(|e: axum::Error| anyhow!("local_to_blobcast stream broken: {}", e))
+        .map_err(|e: axum::Error| eyre!("local_to_blobcast stream broken: {}", e))
         .map(
-            move |m| -> Result<tokio_tungstenite::tungstenite::Message, anyhow::Error> {
-                let m = match m.context("local_to_blobcast message failed to be received")? {
+            move |m| -> eyre::Result<tokio_tungstenite::tungstenite::Message> {
+                let m = match m.wrap_err("local_to_blobcast message failed to be received")? {
                     axum::extract::ws::Message::Text(m) => {
                         let mut sm = m.split(":::");
                         let opcode = sm.next().unwrap();
@@ -505,29 +508,29 @@ pub async fn handle_socket_proxy(
                             role = ?Role::Host,
                             opcode = opcode,
                             message = %{
-                                json_message.map(|m| -> anyhow::Result<String> {
+                                json_message.map(|m| -> eyre::Result<String> {
                                     if let Ok(jq) = std::process::Command::new("jq")
                                         .stdin(Stdio::piped())
                                         .stdout(Stdio::piped())
                                         .arg("-C")
                                         .spawn() {
-                                            let mut jq_in = jq.stdin.context("jq process has no stdin")?;
-                                            let mut jq_out = jq.stdout.context("jq process has no stdout")?;
+                                            let mut jq_in = jq.stdin.ok_or_eyre("jq process has no stdin")?;
+                                            let mut jq_out = jq.stdout.ok_or_eyre("jq process has no stdout")?;
                                             jq_in.write_all(m.as_bytes())
-                                                .context("Failed to write to jq process")?;
+                                                .wrap_err("Failed to write to jq process")?;
                                             jq_in.write_all(b"\n")
-                                                .context("Failed to write to jq process")?;
+                                                .wrap_err("Failed to write to jq process")?;
                                             drop(jq_in);
                                             let mut jm = String::new();
                                             jq_out.read_to_string(&mut jm)
-                                                .context("Failed to read from jq process")?;
+                                                .wrap_err("Failed to read from jq process")?;
                                             Ok(jm)
                                         } else {
                                             Ok(m.to_owned())
                                         }
                                 })
                                 .unwrap_or_else(|| Ok(String::new()))
-                                .with_context(|| format!("jq coloration failed for message: {:?}", json_message))?
+                                .wrap_err_with(|| format!("jq coloration failed for message: {:?}", json_message))?
                             },
                             "to blobcast",
                         );
@@ -559,14 +562,14 @@ pub async fn handle_socket_proxy(
                 m
             },
         )
-        .forward(blobcast_write.sink_map_err(|e| anyhow!(e)));
+        .forward(blobcast_write.sink_map_err(|e| eyre!(e)));
 
     let blobcast_to_local = blobcast_read
         .map_err(|e: tokio_tungstenite::tungstenite::Error| {
-            anyhow!("blobcast_to_local stream broken: {}", e)
+            eyre!("blobcast_to_local stream broken: {}", e)
         })
-        .map(|m| -> Result<axum::extract::ws::Message, anyhow::Error> {
-            let m = match m.context("blobcast_to_local message failed to be received")? {
+        .map(|m| -> eyre::Result<axum::extract::ws::Message> {
+            let m = match m.wrap_err("blobcast_to_local message failed to be received")? {
                 tokio_tungstenite::tungstenite::Message::Text(m) => {
                     let mut sm = m.split(":::");
                     let opcode = sm.next().unwrap();
@@ -575,29 +578,29 @@ pub async fn handle_socket_proxy(
                         role = ?Role::Host,
                         opcode = opcode,
                         message = %{
-                            json_message.map(|m| -> anyhow::Result<String> {
+                            json_message.map(|m| -> eyre::Result<String> {
                                 if let Ok(jq) = std::process::Command::new("jq")
                                     .stdin(Stdio::piped())
                                     .stdout(Stdio::piped())
                                     .arg("-C")
                                     .spawn() {
-                                        let mut jq_in = jq.stdin.context("jq process has no stdin")?;
-                                        let mut jq_out = jq.stdout.context("jq process has no stdout")?;
+                                        let mut jq_in = jq.stdin.ok_or_eyre("jq process has no stdin")?;
+                                        let mut jq_out = jq.stdout.ok_or_eyre("jq process has no stdout")?;
                                         jq_in.write_all(m.as_bytes())
-                                            .context("Failed to write to jq process")?;
+                                            .wrap_err("Failed to write to jq process")?;
                                         jq_in.write_all(b"\n")
-                                            .context("Failed to write to jq process")?;
+                                            .wrap_err("Failed to write to jq process")?;
                                         drop(jq_in);
                                         let mut jm = String::new();
                                         jq_out.read_to_string(&mut jm)
-                                            .context("Failed to read from jq process")?;
+                                            .wrap_err("Failed to read from jq process")?;
                                         Ok(jm)
                                     } else {
                                         Ok(m.to_owned())
                                     }
                             })
                             .unwrap_or_else(|| Ok(String::new()))
-                            .with_context(|| format!("jq coloration failed for message: {:?}", json_message))?
+                            .wrap_err_with(|| format!("jq coloration failed for message: {:?}", json_message))?
                         },
                         "blobcast to",
                     );
@@ -629,7 +632,7 @@ pub async fn handle_socket_proxy(
             );
             m
         })
-        .forward(local_write.sink_map_err(|e| anyhow!(e)));
+        .forward(local_write.sink_map_err(|e| eyre!(e)));
 
     tokio::pin!(local_to_blobcast, blobcast_to_local);
 

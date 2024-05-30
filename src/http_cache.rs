@@ -11,6 +11,7 @@ use axum::http::uri::{Authority, Scheme};
 use axum::http::HeaderMap;
 use axum::http::{uri, HeaderValue};
 use axum::response::{IntoResponse, Response};
+use color_eyre::eyre::{eyre, Context, OptionExt};
 use futures_util::TryStreamExt;
 use helix_core::syntax::RopeProvider;
 use helix_core::{Rope, RopeBuilder};
@@ -24,8 +25,10 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{io::AsyncBufReadExt, sync::Mutex};
 use tokio_util::io::StreamReader;
+use tracing::instrument;
 use tree_sitter::QueryCursor;
 
+use crate::error::{PropogateRequest, WithStatusCode};
 use crate::CacheMode;
 
 #[derive(Clone)]
@@ -50,37 +53,64 @@ struct JBHttpResponse {
 }
 
 impl JBHttpResponse {
-    fn from_request(value: &reqwest::Response, content_to_compress: &Regex) -> Self {
-        Self {
+    fn from_request(
+        value: &reqwest::Response,
+        content_to_compress: &Regex,
+    ) -> crate::error::Result<Self> {
+        Ok(Self {
             etag: value
                 .headers()
                 .get(ETAG)
-                .unwrap()
+                .ok_or_eyre("Etag was not present in response")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
                 .to_str()
-                .unwrap()
+                .wrap_err("Etag was not valid UTF-8")
+                .with_status_code(StatusCode::UNPROCESSABLE_ENTITY)?
                 .to_owned(),
-            content_type: value
-                .headers()
-                .get(CONTENT_TYPE)
-                .map(|ct| ct.to_str().unwrap().to_owned()),
+            content_type: {
+                if let Some(content_type) = value.headers().get(CONTENT_TYPE) {
+                    let content_type = content_type
+                        .to_str()
+                        .wrap_err("Content-Type was not valid UTF-8")
+                        .with_status_code(StatusCode::UNPROCESSABLE_ENTITY)?;
+
+                    Some(content_type.to_owned())
+                } else {
+                    None
+                }
+            },
             compressed: value
                 .headers()
                 .get(CONTENT_TYPE)
                 .is_some_and(|ct| content_to_compress.is_match(Input::new(ct.as_bytes()))),
-        }
+        })
     }
 
-    fn headers(&self) -> HeaderMap {
+    fn headers(&self) -> crate::error::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        headers.insert(ETAG, self.etag.as_str().try_into().unwrap());
+        headers.insert(
+            ETAG,
+            self.etag
+                .as_str()
+                .try_into()
+                .wrap_err("Failed to convert Etag from String to HeaderValue")
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
+        );
         if let Some(ref ct) = self.content_type {
-            headers.insert(CONTENT_TYPE, ct.as_str().try_into().unwrap());
+            headers.insert(
+                CONTENT_TYPE,
+                ct.as_str()
+                    .try_into()
+                    .wrap_err("Failed to convert Content-Type from String to HeaderValue")
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
+            );
         }
-        headers
+        Ok(headers)
     }
 }
 
 impl HttpCache {
+    #[instrument(skip(self, headers, uri))]
     pub async fn get_cached(
         &self,
         mut uri: uri::Uri,
@@ -88,7 +118,7 @@ impl HttpCache {
         cache_mode: CacheMode,
         accessible_host: &str,
         cache_path: &Path,
-    ) -> Result<Response, (StatusCode, String)> {
+    ) -> crate::error::Result<Response> {
         let mut uri_parts = uri.into_parts();
         if uri_parts
             .path_and_query
@@ -102,42 +132,67 @@ impl HttpCache {
             let path_split = path_split.split_once('/').unwrap_or((path_split, ""));
             let host = path_split.0;
             if !self.regexes.jackbox_urls.is_match(Input::new(host)) {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "Proxy can only be used with Jackbox services".to_owned(),
-                ));
+                return Err(eyre!("Proxy can only be used with Jackbox services"))
+                    .with_status_code(StatusCode::BAD_REQUEST);
             }
-            uri_parts.authority = Some(host.to_owned().try_into().unwrap());
-            headers.insert(HOST, host.to_owned().try_into().unwrap());
-            *uri_parts.path_and_query.as_mut().unwrap() =
-                format!("/{}", path_split.1).try_into().unwrap();
+            uri_parts.authority = Some(
+                host.to_owned()
+                    .try_into()
+                    .wrap_err_with(|| format!("Failed to convert host `{}` into Authority", host))
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
+            );
+            headers.insert(
+                HOST,
+                host.to_owned()
+                    .try_into()
+                    .wrap_err_with(|| format!("Failed to convert host `{}` into HeaderValue", host))
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
+            );
+            let path_and_query = format!("/{}", path_split.1);
+            *uri_parts.path_and_query.as_mut().unwrap() = path_and_query
+                .as_str()
+                .try_into()
+                .wrap_err_with(|| {
+                    format!(
+                        "Failed to convert `{}` to a URI path & query",
+                        path_and_query
+                    )
+                })
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
         } else {
             uri_parts.authority = Some(Authority::from_static("jackbox.tv"));
             headers.insert(HOST, HeaderValue::from_static("jackbox.tv"));
         }
-        uri_parts.scheme = Some(Scheme::try_from("https").unwrap());
-        uri = uri::Uri::from_parts(uri_parts).unwrap();
+        uri_parts.scheme = Some(Scheme::HTTPS);
+        uri = uri::Uri::from_parts(uri_parts)
+            .wrap_err("URI parts did not make a valid URI")
+            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
         headers.remove(IF_MODIFIED_SINCE);
 
         let br = headers
             .get(ACCEPT_ENCODING)
             .as_ref()
-            .map(|e| e.to_str().unwrap().split(','))
+            .map(|e| e.to_str())
             .into_iter()
             .flatten()
+            .flat_map(|e| e.split(','))
             .any(|s| s.trim() == "br");
 
-        let mut cached_resource_raw = cache_path.join(format!(
+        let cached_resource_raw = cache_path.join(format!(
             "{}/{}",
-            uri.host().unwrap(),
+            uri.host()
+                .ok_or_else(|| eyre!("URI `{}` did not have a host", uri))
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
             if uri.path() == "/" {
                 "index.html"
             } else {
                 uri.path()
             }
         ));
-        let mut reqwest_resp = if matches!(cache_mode, CacheMode::Offline | CacheMode::Oneshot) {
+        let mut reqwest_resp = if matches!(cache_mode, CacheMode::Offline)
+            || (matches!(cache_mode, CacheMode::Oneshot) && cached_resource_raw.exists())
+        {
             None
         } else {
             Some(
@@ -146,31 +201,31 @@ impl HttpCache {
                     .headers(headers.clone())
                     .send()
                     .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("{}: {}", line!(), e),
-                        )
-                    })?,
+                    .wrap_err_with(|| format!("Failed to acquire resource from `{}`", uri))
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
+                    .propogate_request_if_err()?,
             )
         };
         let mut resp = if let Some(ref resp) = reqwest_resp {
-            JBHttpResponse::from_request(resp, &self.regexes.content_to_compress)
+            JBHttpResponse::from_request(resp, &self.regexes.content_to_compress)?
         } else {
             serde_json::from_reader(BufReader::new(
-                std::fs::File::open(&cached_resource_raw).map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("{}: Failed deserializing offline resource: {}", line!(), e),
-                    )
-                })?,
+                std::fs::File::open(&cached_resource_raw)
+                    .wrap_err_with(|| {
+                        format!(
+                            "The offline resource `{}` could not be found",
+                            cached_resource_raw.display()
+                        )
+                    })
+                    .with_status_code(StatusCode::NOT_FOUND)?,
             ))
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{}: {}", line!(), e),
+            .wrap_err_with(|| {
+                format!(
+                    "The offline resource `{}` could not be deserialized",
+                    cached_resource_raw.display()
                 )
-            })?
+            })
+            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
         };
 
         let mut cached_resource = if resp.compressed {
@@ -180,9 +235,24 @@ impl HttpCache {
         };
 
         let part_path = cached_resource.with_extension("part.br");
-        tokio::fs::create_dir_all(cached_resource.parent().unwrap())
+        let cached_resource_dir = cached_resource
+            .parent()
+            .ok_or_else(|| {
+                eyre!(
+                    "The cached resource `{}` has no parent directory",
+                    cached_resource.display()
+                )
+            })
+            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
+        tokio::fs::create_dir_all(cached_resource_dir)
             .await
-            .unwrap();
+            .wrap_err_with(|| {
+                format!(
+                    "The directory `{}` could not be created for the cached resource",
+                    cached_resource_dir.display()
+                )
+            })
+            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
         if reqwest_resp
             .as_ref()
@@ -200,40 +270,36 @@ impl HttpCache {
                         .headers(headers.clone())
                         .send()
                         .await
-                        .map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{}: {}", line!(), e),
+                        .wrap_err_with(|| {
+                            format!(
+                                "Failed to acquire resource from `{}` (with stripped Etag)",
+                                uri
                             )
-                        })?,
+                        })
+                        .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
+                        .propogate_request_if_err()?,
                 )
             };
-            cached_resource_raw = cache_path.join(format!(
-                "{}/{}",
-                uri.host().unwrap(),
-                if uri.path() == "/" {
-                    "index.html"
-                } else {
-                    uri.path()
-                }
-            ));
             resp = if let Some(ref resp) = reqwest_resp {
-                JBHttpResponse::from_request(resp, &self.regexes.content_to_compress)
+                JBHttpResponse::from_request(resp, &self.regexes.content_to_compress)?
             } else {
                 serde_json::from_reader(BufReader::new(
-                    std::fs::File::open(&cached_resource_raw).map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("{}: {}", line!(), e),
-                        )
-                    })?,
+                    std::fs::File::open(&cached_resource_raw)
+                        .wrap_err_with(|| {
+                            format!(
+                                "The offline resource `{}` could not be found (stripped Etag)",
+                                cached_resource_raw.display()
+                            )
+                        })
+                        .with_status_code(StatusCode::NOT_FOUND)?,
                 ))
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("{}: {}", line!(), e),
+                .wrap_err_with(|| {
+                    format!(
+                        "The offline resource `{}` could not be deserialized (stripped Etag)",
+                        cached_resource_raw.display()
                     )
-                })?
+                })
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
             };
             cached_resource = if resp.compressed {
                 cache_path.join(format!("{}/{}.br", uri.host().unwrap(), resp.etag))
@@ -249,14 +315,23 @@ impl HttpCache {
                     .write(true)
                     .open(&part_path)
                     .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("{}: {}", line!(), e),
+                    .wrap_err_with(|| {
+                        format!(
+                            "Failed to open/create part file for resource `{}`",
+                            part_path.display()
                         )
-                    })?,
+                    })
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
             );
-            let mut part_file_w = part_file.write().unwrap();
+            let mut part_file_w = part_file
+                .write()
+                .wrap_err_with(|| {
+                    format!(
+                        "Failed to open part file for writing for resource `{}`",
+                        part_path.display()
+                    )
+                })
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
             if reqwest_resp
                 .as_ref()
                 .map(|r| r.status() == StatusCode::NOT_MODIFIED)
@@ -274,17 +349,16 @@ impl HttpCache {
                             }),
                         ))
                         .await
-                        .map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{}: {}", line!(), e),
-                            )
-                        })?;
+                        .wrap_err("Failed to convert JavaScript response byte stream to Rope")
+                        .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         let mut lock = self.ts_parser.lock().await;
                         let (parser, query_cursor) = lock.deref_mut();
 
-                        parser.set_language(&self.js_lang.0).unwrap();
+                        parser
+                            .set_language(&self.js_lang.0)
+                            .wrap_err("Failed to initialize JavaScript parser")
+                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         let tree = parser
                             .parse_with(
@@ -299,7 +373,8 @@ impl HttpCache {
                                 },
                                 None,
                             )
-                            .unwrap();
+                            .ok_or_eyre("Failed to parse JavaScript resource")
+                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         let mut edits: Vec<TextEdit> = Vec::new();
                         for query_match in query_cursor.matches(
@@ -337,10 +412,8 @@ impl HttpCache {
                         );
 
                         if !transaction.apply(&mut rope) {
-                            return Err((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "Failed to patch JS file".to_owned(),
-                            ));
+                            return Err(eyre!("Failed to patch JavaScript file"))
+                                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR);
                         }
 
                         if resp.compressed {
@@ -351,38 +424,34 @@ impl HttpCache {
                             );
 
                             for chunk in rope.chunks() {
-                                stream.write_all(chunk.as_bytes()).await.map_err(|e| {
-                                    (
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        format!("{}: {}", line!(), e),
-                                    )
-                                })?;
+                                stream
+                                    .write_all(chunk.as_bytes())
+                                    .await
+                                    .wrap_err("Failed to write Rope chunk to brotli compressor")
+                                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                             }
 
-                            stream.shutdown().await.map_err(|e| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    format!("{}: {}", line!(), e),
-                                )
-                            })?;
+                            stream
+                                .shutdown()
+                                .await
+                                .wrap_err("Failed to shutdown brotli compression stream")
+                                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                         } else {
                             let mut stream = tokio::io::BufWriter::new(part_file_w.deref_mut());
 
                             for chunk in rope.chunks() {
-                                stream.write_all(chunk.as_bytes()).await.map_err(|e| {
-                                    (
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        format!("{}: {}", line!(), e),
-                                    )
-                                })?;
+                                stream
+                                    .write_all(chunk.as_bytes())
+                                    .await
+                                    .wrap_err("Failed to write Rope chunk to uncompressed stream")
+                                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                             }
 
-                            stream.shutdown().await.map_err(|e| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    format!("{}: {}", line!(), e),
-                                )
-                            })?;
+                            stream
+                                .shutdown()
+                                .await
+                                .wrap_err("Failed to shutdown uncompressed stream")
+                                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                         }
                     }
                     Some("text/css") => {
@@ -392,17 +461,16 @@ impl HttpCache {
                             }),
                         ))
                         .await
-                        .map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{}: {}", line!(), e),
-                            )
-                        })?;
+                        .wrap_err("Failed to convert CSS response byte stream to Rope")
+                        .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         let mut lock = self.ts_parser.lock().await;
                         let (parser, query_cursor) = lock.deref_mut();
 
-                        parser.set_language(&self.css_lang.0).unwrap();
+                        parser
+                            .set_language(&self.css_lang.0)
+                            .wrap_err("Failed to initialize JavaScript parser")
+                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         let tree = parser
                             .parse_with(
@@ -417,7 +485,8 @@ impl HttpCache {
                                 },
                                 None,
                             )
-                            .unwrap();
+                            .ok_or_eyre("Failed to parse CSS resource")
+                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
                         let mut edits: Vec<TextEdit> = Vec::new();
                         for query_match in query_cursor.matches(
@@ -455,10 +524,8 @@ impl HttpCache {
                         );
 
                         if !transaction.apply(&mut rope) {
-                            return Err((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "Failed to patch CSS file".to_owned(),
-                            ));
+                            return Err(eyre!("Failed to patch CSS file"))
+                                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR);
                         }
 
                         if resp.compressed {
@@ -469,38 +536,34 @@ impl HttpCache {
                             );
 
                             for chunk in rope.chunks() {
-                                stream.write_all(chunk.as_bytes()).await.map_err(|e| {
-                                    (
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        format!("{}: {}", line!(), e),
-                                    )
-                                })?;
+                                stream
+                                    .write_all(chunk.as_bytes())
+                                    .await
+                                    .wrap_err("Failed to write Rope chunk to brotli compressor")
+                                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                             }
 
-                            stream.shutdown().await.map_err(|e| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    format!("{}: {}", line!(), e),
-                                )
-                            })?;
+                            stream
+                                .shutdown()
+                                .await
+                                .wrap_err("Failed to shutdown brotli compression stream")
+                                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                         } else {
                             let mut stream = tokio::io::BufWriter::new(part_file_w.deref_mut());
 
                             for chunk in rope.chunks() {
-                                stream.write_all(chunk.as_bytes()).await.map_err(|e| {
-                                    (
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        format!("{}: {}", line!(), e),
-                                    )
-                                })?;
+                                stream
+                                    .write_all(chunk.as_bytes())
+                                    .await
+                                    .wrap_err("Failed to write Rope chunk to uncompressed stream")
+                                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                             }
 
-                            stream.shutdown().await.map_err(|e| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    format!("{}: {}", line!(), e),
-                                )
-                            })?;
+                            stream
+                                .shutdown()
+                                .await
+                                .wrap_err("Failed to shutdown uncompressed stream")
+                                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                         }
                     }
                     _ if resp.compressed => {
@@ -513,19 +576,15 @@ impl HttpCache {
 
                         let mut file = tokio::io::BufWriter::new(part_file_w.deref_mut());
 
-                        tokio::io::copy(&mut stream, &mut file).await.map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to encode: {}", e),
-                            )
-                        })?;
+                        tokio::io::copy(&mut stream, &mut file)
+                            .await
+                            .wrap_err("Failed to copy byte stream to a compressed brotli file")
+                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-                        file.shutdown().await.map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{}: {}", line!(), e),
-                            )
-                        })?;
+                        file.shutdown()
+                            .await
+                            .wrap_err("Failed to shutdown compressed brotli file stream")
+                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                     }
                     _ => {
                         let mut stream =
@@ -534,52 +593,65 @@ impl HttpCache {
                             }));
                         let mut file = tokio::io::BufWriter::new(part_file_w.deref_mut());
 
-                        tokio::io::copy(&mut stream, &mut file).await.map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Failed to encode: {}", e),
-                            )
-                        })?;
+                        tokio::io::copy(&mut stream, &mut file)
+                            .await
+                            .wrap_err("Failed to copy byte stream to an uncompressed file")
+                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-                        file.shutdown().await.map_err(|e| {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{}: {}", line!(), e),
-                            )
-                        })?;
+                        file.shutdown()
+                            .await
+                            .wrap_err("Failed to shutdown uncompressed file stream")
+                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                     }
                 }
-                tokio::fs::create_dir_all(cached_resource_raw.parent().unwrap())
+                let cached_resource_raw_dir = cached_resource_raw
+                    .parent()
+                    .ok_or_else(|| {
+                        eyre!(
+                            "Raw cached resource `{}` does not have a parent directory",
+                            cached_resource_raw.display()
+                        )
+                    })
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
+                tokio::fs::create_dir_all(cached_resource_raw_dir)
                     .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("{}: {}", line!(), e),
+                    .wrap_err_with(|| {
+                        format!(
+                            "Failed to create directory for raw resource `{}`",
+                            cached_resource_raw_dir.display()
                         )
-                    })?;
+                    })
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                 serde_json::to_writer(
-                    BufWriter::new(std::fs::File::create(cached_resource_raw).map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("{}: {}", line!(), e),
-                        )
-                    })?),
+                    BufWriter::new(
+                        std::fs::File::create(&cached_resource_raw)
+                            .wrap_err_with(|| {
+                                format!(
+                                    "Failed to create file for raw resource `{}`",
+                                    cached_resource_raw.display()
+                                )
+                            })
+                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
+                    ),
                     &resp,
                 )
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("{}: {}", line!(), e),
+                .wrap_err_with(|| {
+                    format!(
+                        "Failed to serialize raw resource `{}`",
+                        cached_resource_raw.display()
                     )
-                })?;
-                tokio::fs::rename(part_path, &cached_resource)
+                })
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
+                tokio::fs::rename(&part_path, &cached_resource)
                     .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("{}: {}", line!(), e),
+                    .wrap_err_with(|| {
+                        format!(
+                            "Failed to move part file `{}` into it's cached resource path `{}`",
+                            part_path.display(),
+                            cached_resource.display()
                         )
-                    })?;
+                    })
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
             }
         }
 
@@ -595,7 +667,7 @@ impl HttpCache {
 
         let status_code = StatusCode::OK;
 
-        let mut resp_headers = resp.headers();
+        let mut resp_headers = resp.headers()?;
         let content_type = resp_headers.get(CONTENT_TYPE).cloned();
         if br {
             if resp.compressed {
@@ -604,9 +676,15 @@ impl HttpCache {
             let mut resp = (
                 status_code,
                 resp_headers,
-                tokio::fs::read(cached_resource)
+                tokio::fs::read(&cached_resource)
                     .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                    .wrap_err_with(|| {
+                        format!(
+                            "Failed to read cached resource `{}`",
+                            cached_resource.display()
+                        )
+                    })
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
             )
                 .into_response();
             if let Some(t) = content_type {
@@ -618,7 +696,13 @@ impl HttpCache {
             let mut buf = Vec::with_capacity(
                 tokio::fs::metadata(&cached_resource)
                     .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                    .wrap_err_with(|| {
+                        format!(
+                            "Failed to read metadata for cached resource `{}`",
+                            cached_resource.display()
+                        )
+                    })
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?
                     .size() as usize,
             );
             let mut resp = if resp.compressed {
@@ -626,11 +710,23 @@ impl HttpCache {
                     BrotliDecoder::new(tokio::io::BufReader::new(
                         tokio::fs::File::open(&cached_resource)
                             .await
-                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                            .wrap_err_with(|| {
+                                format!(
+                                    "Failed to open cached resource `{}`",
+                                    cached_resource.display()
+                                )
+                            })
+                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
                     ))
                     .read_to_end(&mut buf)
                     .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    .wrap_err_with(|| {
+                        format!(
+                            "Failed to decompress cached resource `{}`",
+                            cached_resource.display()
+                        )
+                    })
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                     buf
                 })
                     .into_response()
@@ -639,11 +735,23 @@ impl HttpCache {
                     tokio::io::BufReader::new(
                         tokio::fs::File::open(&cached_resource)
                             .await
-                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                            .wrap_err_with(|| {
+                                format!(
+                                    "Failed to open cached resource `{}`",
+                                    cached_resource.display()
+                                )
+                            })
+                            .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
                     )
                     .read_to_end(&mut buf)
                     .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    .wrap_err_with(|| {
+                        format!(
+                            "Failed to read cached resource `{}`",
+                            cached_resource.display()
+                        )
+                    })
+                    .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?;
                     buf
                 })
                     .into_response()

@@ -11,7 +11,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -24,7 +23,9 @@ use axum::{
     BoxError, Json, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
+use color_eyre::eyre::{self, Context};
 use dashmap::DashMap;
+use error::WithStatusCode;
 use futures_util::{
     stream::{SplitSink, SplitStream},
     SinkExt,
@@ -40,13 +41,16 @@ use tokio::{
     sync::{Mutex, Notify, RwLock},
 };
 use tower_http::{services::ServeDir, trace::TraceLayer};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing::instrument;
+use tracing_error::ErrorLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use tree_sitter::{Parser, QueryCursor};
 
 mod acl;
 mod blobcast;
 mod ecast;
 mod entity;
+mod error;
 mod http_cache;
 mod tts;
 
@@ -192,7 +196,7 @@ struct CacheConfig {
     cache_mode: CacheMode,
 }
 
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Deserialize, Clone, Copy, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheMode {
     Online,
@@ -253,39 +257,34 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn send_ecast(
-        &self,
-        mut message: ecast::ws::JBMessage<'_>,
-    ) -> Result<(), anyhow::Error> {
+    pub async fn send_ecast(&self, mut message: ecast::ws::JBMessage<'_>) -> eyre::Result<()> {
         message.pc = self.pc.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
-        tracing::debug!(id = self.profile.id, role = ?self.profile.role, ?message, "Sending WS Message");
+        tracing::debug!(?message, "Sending WS Message");
 
         if let Err(e) = self
             .send_ws_message(Message::Text(
-                serde_json::to_string(&message).with_context(|| {
+                serde_json::to_string(&message).wrap_err_with(|| {
                     format!("Failed to serialize ecast message: {:?}", &message)
                 })?,
             ))
             .await
         {
             self.disconnect().await;
-            return Err(e).with_context(|| format!("Ecast message failed to send: {:?}", &message));
+            return Err(e)
+                .wrap_err_with(|| format!("Ecast message failed to send: {:?}", &message));
         }
 
         Ok(())
     }
 
-    pub async fn send_blobcast(
-        &self,
-        message: blobcast::ws::JBMessage<'_>,
-    ) -> Result<(), anyhow::Error> {
-        tracing::debug!(id = self.profile.id, role = ?self.profile.role, ?message, "Sending WS Message");
+    pub async fn send_blobcast(&self, message: blobcast::ws::JBMessage<'_>) -> eyre::Result<()> {
+        tracing::debug!(?message, "Sending WS Message");
 
         if let Err(e) = self
             .send_ws_message(Message::Text(format!(
                 "5:::{}",
-                serde_json::to_string(&message).with_context(|| {
+                serde_json::to_string(&message).wrap_err_with(|| {
                     format!("Failed to serialize blobcast message: {:?}", &message)
                 })?
             )))
@@ -293,39 +292,39 @@ impl Client {
         {
             self.disconnect().await;
             return Err(e)
-                .with_context(|| format!("Blobcast message failed to send: {:?}", &message));
+                .wrap_err_with(|| format!("Blobcast message failed to send: {:?}", &message));
         }
 
         Ok(())
     }
 
-    pub async fn ping(&self, d: Vec<u8>) -> Result<(), anyhow::Error> {
+    pub async fn ping(&self, d: Vec<u8>) -> eyre::Result<()> {
         if let Err(e) = self.send_ws_message(Message::Ping(d)).await {
             self.disconnect().await;
-            return Err(e).context("Failed to ping socket");
+            return Err(e).wrap_err("Failed to ping socket");
         }
 
         Ok(())
     }
 
-    pub async fn pong(&self, d: Vec<u8>) -> Result<(), anyhow::Error> {
+    pub async fn pong(&self, d: Vec<u8>) -> eyre::Result<()> {
         if let Err(e) = self.send_ws_message(Message::Pong(d)).await {
             self.disconnect().await;
-            return Err(e).context("Failed to pong socket");
+            return Err(e).wrap_err("Failed to pong socket");
         }
 
         Ok(())
     }
 
-    pub async fn close(&self) -> Result<(), anyhow::Error> {
-        tracing::debug!(id = self.profile.id, role = ?self.profile.role, "Closing connection");
+    pub async fn close(&self) -> eyre::Result<()> {
+        tracing::debug!("Closing connection");
 
         self.send_ws_message(Message::Close(Some(axum::extract::ws::CloseFrame {
             code: 1000,
             reason: Cow::Borrowed("normal close"),
         })))
         .await
-        .context("Failed to close connection")?;
+        .wrap_err("Failed to close connection")?;
 
         Ok(())
     }
@@ -334,12 +333,12 @@ impl Client {
         *self.socket.lock().await = None;
     }
 
-    pub async fn send_ws_message(&self, message: Message) -> Result<(), anyhow::Error> {
+    pub async fn send_ws_message(&self, message: Message) -> eyre::Result<()> {
         if let Some(socket) = self.socket.lock().await.deref_mut() {
             tokio::select! {
-                r = socket.send(message) => r.context("WS Message failed to send")?,
+                r = socket.send(message) => r.wrap_err("WS Message failed to send")?,
                 _ = tokio::time::sleep(Duration::from_secs(3)) => {
-                    tracing::error!(id = self.profile.id, role = ?self.profile.role, "Connection timed out");
+                    tracing::error!("Connection timed out");
                     self.disconnect().await;
                 }
             }
@@ -349,6 +348,7 @@ impl Client {
     }
 }
 
+#[derive(Debug)]
 pub struct Room {
     pub entities: DashMap<String, entity::JBEntity>,
     pub connections: Connections,
@@ -365,32 +365,38 @@ pub struct ConnectedSocket {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> eyre::Result<()> {
+    color_eyre::install()?;
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_default())
+        .with(
+            EnvFilter::try_from_default_env()
+                .or_else(|_| EnvFilter::try_new("info"))
+                .unwrap(),
+        )
         .with(tracing_subscriber::fmt::layer())
+        .with(ErrorLayer::default())
         .init();
 
     let config_file =
-        std::fs::read_to_string("config.toml").context("Could not read config.toml")?;
+        std::fs::read_to_string("config.toml").wrap_err("Could not read config.toml")?;
     let config: Config =
-        toml::from_str(&config_file).context("Failed to deserialize config.toml")?;
+        toml::from_str(&config_file).wrap_err("Failed to deserialize config.toml")?;
 
     let tls_config = RustlsConfig::from_pem_file(&config.tls.cert, &config.tls.key)
         .await
-        .with_context(|| format!("TLS Config failed: {:?}", config.tls))?;
+        .wrap_err_with(|| format!("TLS Config failed: {:?}", config.tls))?;
 
     let fragment_regex = RegexBuilder::new()
         .build("blobcast.jackboxgames.com|ecast.jackboxgames.com|bundles.jackbox.tv|jackbox.tv|cdn.jackboxgames.com|s3.amazonaws.com")
-        .context("fragment_regex failed to build")?;
-    let content_to_compress = RegexBuilder::new().build("text/html|text/css|text/xml|text/javascript|application/javascript|application/x-javascript|application/json").context("content_to_compress regex failed to build")?;
+        .wrap_err("fragment_regex failed to build")?;
+    let content_to_compress = RegexBuilder::new().build("text/html|text/css|text/xml|text/javascript|application/javascript|application/x-javascript|application/json").wrap_err("content_to_compress regex failed to build")?;
 
     let js_lang = tree_sitter_javascript::language();
     let fragment_query = tree_sitter::Query::new(&js_lang, "(string_fragment) @frag")
-        .context("fragment_query failed to build")?;
+        .wrap_err("fragment_query failed to build")?;
     let css_lang = tree_sitter_css::language();
     let css_query = tree_sitter::Query::new(&css_lang, "(plain_value) @frag")
-        .context("css_query failed to build")?;
+        .wrap_err("css_query failed to build")?;
     let state = State {
         blobcast_host: Arc::new(RwLock::new(String::new())),
         room_map: Arc::new(DashMap::new()),
@@ -409,7 +415,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::fs::create_dir_all(&state.config.doodles.path)
         .await
-        .with_context(|| {
+        .wrap_err_with(|| {
             format!(
                 "Failed to create doodles dir: {}",
                 state.config.doodles.path.display()
@@ -463,11 +469,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[instrument(skip(state, headers))]
 async fn serve_jb_tv(
     axum::extract::State(state): axum::extract::State<State>,
     headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
-) -> Result<Response, (StatusCode, String)> {
+) -> crate::error::Result<Response> {
     if uri.query().is_some_and(|q| q.contains("&s=")) {
         let mut new_query: String = format!("{}?", uri.path());
         new_query.extend(
@@ -479,16 +486,25 @@ async fn serve_jb_tv(
         );
         new_query.pop();
         let mut parts = uri.into_parts();
-        parts.path_and_query = Some(PathAndQuery::try_from(new_query).unwrap());
+        parts.path_and_query = Some(
+            PathAndQuery::try_from(&new_query)
+                .wrap_err_with(|| format!("Generated query `{}` was not valid", new_query))
+                .with_status_code(StatusCode::INTERNAL_SERVER_ERROR)?,
+        );
 
         return Ok(Redirect::to(&Uri::from_parts(parts).unwrap().to_string()).into_response());
     }
     if headers
         .get(USER_AGENT)
-        .map(|a| a.to_str().unwrap().starts_with("JackboxGames"))
-        .unwrap_or_default()
+        .map(|a| {
+            Ok(a.to_str()
+                .wrap_err("UserAgent was not valid UTF-8")
+                .with_status_code(StatusCode::UNPROCESSABLE_ENTITY)?
+                .starts_with("JackboxGames"))
+        })
+        .unwrap_or(Ok(false))?
     {
-        tracing::error!(uri = ?uri, "unknown endpoint");
+        tracing::error!("unknown endpoint");
         Ok(Json(json! ({ "ok": true, "body": {} })).into_response())
     } else {
         return state

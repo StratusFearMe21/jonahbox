@@ -216,8 +216,7 @@ dependencies = [
 [[package]]
 name = "axum-server"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1ad46c3ec4e12f4a4b6835e173ba21c25e484c9d02b49770bf006ce5367c036"
+source = "git+https://github.com/lexe-app/axum-server?branch=phlip9/fix-graceful-shutdown#8e3368d899079818934e61cc9c839abcbbcada8a"
 dependencies = [
  "arc-swap",
  "bytes",

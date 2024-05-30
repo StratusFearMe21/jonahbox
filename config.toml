@@ -15,11 +15,11 @@ cache_path = "jb_cache"
 # Serves assets from `jackbox.tv`, and only contacts 
 # the web if an asset is not already in the cache
 #
-# cache_mode = "oneshot"
+cache_mode = "oneshot"
 #
 # Serves assets only from the cache, never contacts `jackbox.tv`
 #
-cache_mode = "offline"
+# cache_mode = "offline"
 
 # Allows pseudo post-game sharing by rendering completed doodles to a directory
 # Only works with games that use the doodle API.

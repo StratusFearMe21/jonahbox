@@ -413,6 +413,8 @@ async fn main() -> eyre::Result<()> {
         config: Arc::new(config),
     };
 
+    let shutdown_state = state.clone();
+
     tokio::fs::create_dir_all(&state.config.doodles.path)
         .await
         .wrap_err_with(|| {
@@ -463,7 +465,7 @@ async fn main() -> eyre::Result<()> {
             .handle(handle.clone())
             .serve(app.into_make_service()),
         redirect_http_to_https(ports, handle.clone()),
-        shutdown_signal(handle)
+        shutdown_signal(shutdown_state, handle)
     )?;
 
     Ok(())
@@ -587,7 +589,7 @@ async fn redirect_http_to_https(
     }
 }
 
-async fn shutdown_signal(handle: axum_server::Handle) -> Result<(), std::io::Error> {
+async fn shutdown_signal(state: State, handle: axum_server::Handle) -> Result<(), std::io::Error> {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -611,6 +613,13 @@ async fn shutdown_signal(handle: axum_server::Handle) -> Result<(), std::io::Err
     }
 
     tracing::info!("Received termination signal shutting down");
+    for room in state.room_map.iter() {
+        for connection in room.connections.iter() {
+            if let Some(socket) = connection.socket.lock().await.as_mut() {
+                socket.close().await.unwrap()
+            }
+        }
+    }
     handle.graceful_shutdown(Some(Duration::from_secs(10))); // 10 secs is how long docker will wait
                                                              // to force shutdown
     Ok(())

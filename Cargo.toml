@@ -8,7 +8,8 @@ license = "AGPL-3.0-or-later"
 async-compression = { version = "0.4.10", features = ["brotli", "tokio"] }
 axum = { version = "0.7.5", features = ["ws"] }
 axum-extra = { version = "0.9.3", features = ["typed-header"] }
-axum-server = { version = "0.6.0", features = ["tls-rustls"] }
+# axum-server = { version = "0.6.0", features = ["tls-rustls"] }
+axum-server = { git = "https://github.com/lexe-app/axum-server", branch = "phlip9/fix-graceful-shutdown", features = ["tls-rustls"] }
 futures-util = "0.3.30"
 rand = { version = "0.8.5", default-features = false, features = ["std", "getrandom"] }
 reqwest = { version = "0.12.4", features = ["json", "stream", "gzip"] }

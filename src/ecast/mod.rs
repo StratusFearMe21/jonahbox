@@ -126,11 +126,11 @@ pub async fn play_handler(
                     }
                     Ok(connected) => {
                         if let Err(e) = ws::handle_socket(Arc::clone(&connected.client), Arc::clone(&connected.room), connected.reconnected, connected.read_half, &config.doodles).await {
-                            tracing::error!(id = connected.client.profile.id, role = ?connected.client.profile.role, error = %e, "Error in WebSocket");
+                            tracing::error!(id = connected.client.profile.id, role = ?connected.client.profile.role, code = connected.room.room_config.code, error = %e, "Error in WebSocket");
                             connected.client.disconnect().await;
                         } else {
                             connected.client.disconnect().await;
-                            tracing::debug!(id = connected.client.profile.id, role = ?connected.client.profile.role, "Leaving room");
+                            tracing::debug!(id = connected.client.profile.id, role = ?connected.client.profile.role, code = connected.room.room_config.code, "Leaving room");
                         }
                     }
                 }

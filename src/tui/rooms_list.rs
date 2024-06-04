@@ -1,7 +1,9 @@
 use ratatui::{
-    style::{Modifier, Style},
+    style::{Modifier, Style, Stylize},
     widgets::{Block, Borders, List, Paragraph, StatefulWidget, Widget, Wrap},
 };
+
+use super::AppFocus;
 
 pub struct RoomsList<'a>(pub &'a mut super::TuiState);
 
@@ -10,7 +12,10 @@ impl<'a> Widget for RoomsList<'a> {
     where
         Self: Sized,
     {
-        let block = Block::new().title("Rooms").borders(Borders::all());
+        let mut block = Block::new().title("Rooms").borders(Borders::all());
+        if self.0.app_focus == AppFocus::RoomList {
+            block = block.border_style(Style::new().dim().green());
+        }
         if self.0.state.room_map.is_empty() {
             return Paragraph::new("No rooms have been created yet")
                 .block(block)

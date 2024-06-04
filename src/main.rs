@@ -36,7 +36,10 @@ use rand_xoshiro::Xoshiro128PlusPlus;
 use reqwest::header::USER_AGENT;
 use serde::{de::Error, Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{mpsc::UnboundedSender, Mutex, Notify, RwLock};
+use tokio::sync::{
+    watch::{Receiver, Sender},
+    Mutex, Notify, RwLock,
+};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::instrument;
 use tracing_error::ErrorLayer;
@@ -133,7 +136,7 @@ struct State {
     room_map: Arc<DashMap<String, Arc<Room>>>,
     http_cache: http_cache::HttpCache,
     config: Arc<Config>,
-    tui_sender: UnboundedSender<()>,
+    tui_sender: Sender<()>,
 }
 
 #[derive(Deserialize)]
@@ -354,6 +357,17 @@ pub struct Room {
     pub room_serial: AtomicI64,
     pub room_config: JBRoom,
     pub exit: Notify,
+    pub channel: (Sender<()>, Receiver<()>),
+}
+
+impl Room {
+    async fn close(&self) {
+        for connection in self.connections.iter() {
+            if let Some(socket) = connection.socket.lock().await.as_mut() {
+                socket.close().await.unwrap()
+            }
+        }
+    }
 }
 
 pub struct ConnectedSocket {
@@ -366,7 +380,7 @@ pub struct ConnectedSocket {
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::watch::channel(());
     let log_writer = tui::tracing_writer::TuiWriter::new(tx.clone());
     let fmt_layer = tracing_subscriber::fmt::layer()
         .event_format(log_writer.clone())

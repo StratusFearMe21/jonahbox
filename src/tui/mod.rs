@@ -8,30 +8,59 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     QueueableCommand,
 };
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::StreamExt;
 use qrcode::{render::unicode, QrCode};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Layout},
-    style::{Style, Stylize},
-    text::Span,
     widgets::ListState,
     Frame, Terminal,
 };
-use tokio::{signal, sync::mpsc::UnboundedReceiver};
+use tokio::{signal, sync::watch::Receiver};
 
-use self::{qr_view::QrView, rooms_list::RoomsList, tracing_writer::TuiWriter};
+use self::{room_view::RoomView, rooms_list::RoomsList, tracing_writer::TuiWriter};
 
-mod qr_view;
+mod room_view;
 mod rooms_list;
 pub mod tracing_writer;
 
 struct TuiState {
     log_scroll_state: Option<usize>,
     rooms_list_state: ListState,
+    log: TuiWriter,
     room_qr: String,
     axum_handle: axum_server::Handle,
     state: crate::State,
+    app_focus: AppFocus,
+    room_tab: RoomTabs,
+}
+
+#[derive(PartialEq, Eq)]
+enum AppFocus {
+    RoomList,
+    Tracing,
+}
+
+#[repr(usize)]
+#[derive(Clone, Copy)]
+enum RoomTabs {
+    QRCode,
+    Entities,
+    Players,
+}
+
+impl RoomTabs {
+    const fn list() -> [&'static str; 3] {
+        ["QR Code", "Entities", "Players"]
+    }
+
+    pub fn next(&mut self) {
+        match self {
+            RoomTabs::QRCode => *self = RoomTabs::Entities,
+            RoomTabs::Entities => *self = RoomTabs::Players,
+            RoomTabs::Players => *self = RoomTabs::QRCode,
+        }
+    }
 }
 
 impl TuiState {
@@ -39,31 +68,73 @@ impl TuiState {
         RoomsList(self)
     }
 
-    fn qr_view<'a>(&'a mut self) -> QrView<'a> {
-        QrView(self)
+    fn room_view<'a>(&'a mut self) -> RoomView<'a> {
+        RoomView(self)
     }
 
     fn arrow_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Up => {
-                self.rooms_list_state.select(Some(
-                    self.rooms_list_state
-                        .selected()
-                        .map(|s| s.saturating_sub(1))
-                        .unwrap_or_default(),
-                ));
+            KeyCode::Left => {
+                self.app_focus = AppFocus::RoomList;
+                self.log_scroll_state = None;
+                self.generate_room_qr();
+                return;
             }
-            KeyCode::Down => {
-                self.rooms_list_state.select(Some(
-                    self.rooms_list_state
-                        .selected()
-                        .map(|s| s + 1)
-                        .unwrap_or_default(),
-                ));
+            KeyCode::Right => {
+                self.app_focus = AppFocus::Tracing;
+                self.log_scroll_state = Some(self.log.0.buffer.count());
+                self.room_qr.clear();
+                return;
             }
             _ => {}
         }
+        match self.app_focus {
+            AppFocus::RoomList => {
+                match code {
+                    KeyCode::Up => {
+                        self.rooms_list_state.select(Some(
+                            self.rooms_list_state
+                                .selected()
+                                .map(|s| s.saturating_sub(1))
+                                .unwrap_or_default(),
+                        ));
+                    }
+                    KeyCode::Down => {
+                        self.rooms_list_state.select(Some(
+                            self.rooms_list_state
+                                .selected()
+                                .map(|s| s + 1)
+                                .unwrap_or_default(),
+                        ));
+                    }
+                    _ => {}
+                }
 
+                self.generate_room_qr();
+            }
+            AppFocus::Tracing => match code {
+                KeyCode::Up => {
+                    let state = self
+                        .log_scroll_state
+                        .get_or_insert_with(|| self.log.0.buffer.count());
+                    *state = state.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    let count = self.log.0.buffer.count();
+                    let state = self.log_scroll_state.get_or_insert(count);
+                    *state = state.saturating_add(1);
+
+                    if *state > count {
+                        *state = count;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn generate_room_qr(&mut self) {
+        self.room_qr.clear();
         let room = if let Some(selected) = self.rooms_list_state.selected() {
             let Some(room) = self.state.room_map.iter().nth(selected) else {
                 return;
@@ -80,13 +151,29 @@ impl TuiState {
         .render::<unicode::Dense1x2>()
         .build();
     }
+
+    async fn close_room(&mut self) {
+        let room = if let Some(selected) = self.rooms_list_state.selected() {
+            let Some(room) = self.state.room_map.iter().nth(selected) else {
+                return;
+            };
+            room.close().await;
+            room
+        } else {
+            return;
+        }
+        .key()
+        .to_owned();
+
+        self.state.room_map.remove(&room);
+    }
 }
 
 pub async fn tui(
     axum_handle: axum_server::Handle,
     state: crate::State,
     log: TuiWriter,
-    mut rx: UnboundedReceiver<()>,
+    mut rx: Receiver<()>,
 ) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut tui_state = TuiState {
@@ -95,6 +182,9 @@ pub async fn tui(
         rooms_list_state: ListState::default(),
         axum_handle,
         state,
+        app_focus: AppFocus::RoomList,
+        log,
+        room_tab: RoomTabs::QRCode,
     };
     let mut stdout = BufWriter::new(stdout().lock());
     stdout.queue(EnterAlternateScreen)?.flush()?;
@@ -124,12 +214,12 @@ pub async fn tui(
 
     terminal.clear()?;
     loop {
-        terminal.draw(|frame| ui(frame, &log, &mut tui_state))?;
+        terminal.draw(|frame| ui(frame, &mut tui_state))?;
         let mut event = None;
         tokio::select! {
             _ = &mut ctrl_c => break,
             _ = &mut terminate => break,
-            _ = rx.recv() => {}
+            c = rx.changed() => c.unwrap(),
             e = event_stream.next() => event = e
         }
 
@@ -152,6 +242,17 @@ pub async fn tui(
                 ) => {
                     tui_state.arrow_key(event.code);
                 }
+                event::Event::Key(KeyEvent {
+                    code: KeyCode::Tab, ..
+                }) => {
+                    tui_state.room_tab.next();
+                }
+                event::Event::Key(KeyEvent {
+                    code: KeyCode::Backspace | KeyCode::Delete,
+                    ..
+                }) => {
+                    tui_state.close_room().await;
+                }
                 _ => {}
             }
         }
@@ -164,11 +265,7 @@ pub async fn tui(
         .queue(LeaveAlternateScreen)?
         .flush()?;
     for room in tui_state.state.room_map.iter() {
-        for connection in room.connections.iter() {
-            if let Some(socket) = connection.socket.lock().await.as_mut() {
-                socket.close().await.unwrap()
-            }
-        }
+        room.close().await;
     }
     tui_state
         .axum_handle
@@ -178,46 +275,25 @@ pub async fn tui(
     Ok(())
 }
 
-fn ui(frame: &mut Frame, log: &TuiWriter, tui_state: &mut TuiState) {
-    let main_layout = Layout::new(
-        ratatui::layout::Direction::Vertical,
-        [Constraint::Min(0), Constraint::Length(1)],
-    )
-    .split(frame.size());
+fn ui(frame: &mut Frame, tui_state: &mut TuiState) {
     let split_layout = Layout::new(
         ratatui::layout::Direction::Horizontal,
         [Constraint::Ratio(1, 4), Constraint::Ratio(3, 4)],
     )
-    .split(main_layout[0]);
-    let qr_log_split = Layout::new(
+    .split(frame.size());
+    let room_log_split = Layout::new(
         ratatui::layout::Direction::Vertical,
-        [Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)],
+        [
+            Constraint::Length(tui_state.room_qr.lines().count() as u16),
+            Constraint::Min(0),
+        ],
     )
     .split(split_layout[1]);
-    frame.render_stateful_widget(log, qr_log_split[1], &mut tui_state.log_scroll_state);
-    if tui_state
-        .axum_handle
-        .listening()
-        .now_or_never()
-        .flatten()
-        .is_some()
-    {
-        frame.render_widget(
-            Span::styled("●", Style::new().green()),
-            main_layout[1].inner(&ratatui::layout::Margin {
-                horizontal: 1,
-                vertical: 0,
-            }),
-        );
-    } else {
-        frame.render_widget(
-            Span::styled("●", Style::new().red()),
-            main_layout[1].inner(&ratatui::layout::Margin {
-                horizontal: 1,
-                vertical: 0,
-            }),
-        );
-    }
+    frame.render_stateful_widget(
+        &tui_state.log,
+        room_log_split[1],
+        &mut tui_state.log_scroll_state,
+    );
     frame.render_widget(tui_state.rooms_list(), split_layout[0]);
-    frame.render_widget(tui_state.qr_view(), qr_log_split[0]);
+    frame.render_widget(tui_state.room_view(), room_log_split[0]);
 }

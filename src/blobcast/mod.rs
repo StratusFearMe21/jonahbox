@@ -93,7 +93,7 @@ pub async fn play_handler(
                     }
                     Ok(socket) => {
                         sender.send(()).unwrap();
-                        if let Err(e) = ws::handle_socket(socket.read_half, Arc::clone(&socket.room), Arc::clone(&socket.client), sender).await {
+                        if let Err(e) = ws::handle_socket(socket.read_half, Arc::clone(&socket.room), Arc::clone(&socket.client)).await {
                             tracing::error!(id = socket.client.profile.id, role = ?socket.client.profile.role, error = %e, "Error in WebSocket");
                             socket.client.disconnect().await;
                         } else {
@@ -292,6 +292,7 @@ pub async fn access_token_handler(
                         keepalive: false,
                     },
                     exit: Notify::new(),
+                    channel: tokio::sync::watch::channel(()),
                 }),
             );
 

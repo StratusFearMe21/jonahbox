@@ -6,7 +6,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarState, StatefulWidget, Widget, Wrap},
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::watch::Sender;
 use tracing::{field::Visit, Level, Subscriber};
 use tracing_subscriber::{
     fmt::{FormatEvent, FormatFields, FormattedFields},
@@ -15,11 +15,11 @@ use tracing_subscriber::{
 
 pub struct TuiWriterImpl {
     pub buffer: boxcar::Vec<Line<'static>>,
-    pub notifier: UnboundedSender<()>,
+    pub notifier: Sender<()>,
 }
 
 impl TuiWriterImpl {
-    fn new(notifier: UnboundedSender<()>) -> Self {
+    fn new(notifier: Sender<()>) -> Self {
         Self {
             buffer: boxcar::Vec::default(),
             notifier,
@@ -31,7 +31,7 @@ impl TuiWriterImpl {
 pub struct TuiWriter(pub Arc<TuiWriterImpl>);
 
 impl TuiWriter {
-    pub fn new(notifier: UnboundedSender<()>) -> Self {
+    pub fn new(notifier: Sender<()>) -> Self {
         TuiWriter(Arc::new(TuiWriterImpl::new(notifier)))
     }
 }
@@ -106,7 +106,7 @@ where
         event.record(&mut TuiVisitor(&mut line));
 
         self.0.buffer.push(line);
-        self.0.notifier.send(()).unwrap();
+        let _ = self.0.notifier.send(());
         Ok(())
     }
 }
@@ -116,7 +116,11 @@ impl TuiWriter {
         let mut lines = Vec::new();
 
         for i in range {
-            lines.push(self.0.buffer.get(i).unwrap().clone());
+            if let Some(text) = self.0.buffer.get(i) {
+                lines.push(text.clone())
+            } else {
+                break;
+            }
         }
         Text::from(lines)
     }
@@ -134,6 +138,11 @@ impl<'a> StatefulWidget for &'a TuiWriter {
         Block::new()
             .title("Log")
             .borders(Borders::all())
+            .border_style(if state.is_some() {
+                Style::new().dim().green()
+            } else {
+                Style::new()
+            })
             .render(area, buf);
         let paragraph_area = area.inner(&Margin::new(1, 1));
         let len = self.0.buffer.count();
@@ -144,7 +153,11 @@ impl<'a> StatefulWidget for &'a TuiWriter {
         } else {
             scroll_bar_state.last();
         }
-        let text = self.text(len.saturating_sub(paragraph_area.height as usize)..len);
+        let text = self.text(
+            state
+                .unwrap_or(len)
+                .saturating_sub(paragraph_area.height as usize)..state.unwrap_or(len),
+        );
         let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
         let line_count = paragraph.line_count(paragraph_area.width) as u16;
         let scroll_y = if line_count > paragraph_area.height {

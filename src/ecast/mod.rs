@@ -127,7 +127,7 @@ pub async fn play_handler(
                     }
                     Ok(connected) => {
                         sender.send(()).unwrap();
-                        if let Err(e) = ws::handle_socket(Arc::clone(&connected.client), Arc::clone(&connected.room), connected.reconnected, connected.read_half, &config.doodles, sender).await {
+                        if let Err(e) = ws::handle_socket(Arc::clone(&connected.client), Arc::clone(&connected.room), connected.reconnected, connected.read_half, &config.doodles).await {
                             tracing::error!(id = connected.client.profile.id, role = ?connected.client.profile.role, code = connected.room.room_config.code, error = %e, "Error in WebSocket");
                             connected.client.disconnect().await;
                         } else {
@@ -223,6 +223,7 @@ pub async fn rooms_handler(
                 keepalive: false,
             },
             exit: Notify::new(),
+            channel: tokio::sync::watch::channel(()),
         }),
     );
 

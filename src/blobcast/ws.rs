@@ -21,7 +21,7 @@ use futures_util::{stream::SplitStream, SinkExt, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::Interest,
-    sync::{mpsc::UnboundedSender, Mutex, Notify},
+    sync::{Mutex, Notify},
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::instrument;
@@ -213,6 +213,7 @@ pub async fn connect_socket(
             keepalive: false,
         },
         exit: Notify::new(),
+        channel: tokio::sync::watch::channel(()),
     });
 
     room_map.insert(room_code.clone(), Arc::clone(&room));
@@ -276,7 +277,6 @@ pub async fn handle_socket(
     mut ws_read: SplitStream<WebSocket>,
     room: Arc<Room>,
     client: Arc<Client>,
-    sender: UnboundedSender<()>,
 ) -> eyre::Result<()> {
     'outer: loop {
         tokio::select! {
@@ -314,7 +314,7 @@ pub async fn handle_socket(
                 break
             }
         }
-        sender.send(()).unwrap();
+        room.channel.0.send(()).unwrap();
     }
 
     Ok(())

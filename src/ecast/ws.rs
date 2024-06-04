@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use futures_util::{stream::SplitStream, SinkExt, StreamExt, TryStreamExt};
 use serde::{de::IgnoredAny, ser::SerializeMap, Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc::UnboundedSender, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::instrument;
 
@@ -277,6 +277,7 @@ pub async fn handle_socket(
     reconnect: bool,
     mut ws_read: SplitStream<WebSocket>,
     doodle_config: &DoodleConfig,
+    sender: UnboundedSender<()>,
 ) -> eyre::Result<()> {
     client
         .send_ecast(JBMessage {
@@ -380,6 +381,7 @@ pub async fn handle_socket(
                 break
             }
         }
+        sender.send(()).unwrap();
     }
 
     Ok(())

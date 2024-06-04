@@ -44,6 +44,10 @@ glob = "0.3.1"
 ansi-to-html = { version = "0.2.1", features = ["lazy-init"] }
 color-eyre = "0.6.3"
 tracing-error = "0.2.0"
+ratatui = { version = "0.26.3", features = ["unstable-rendered-line-info"] }
+crossterm = { version = "0.27.0", features = ["event-stream"] }
+boxcar = "0.2.5"
+qrcode = { version = "0.14.0", default-features = false }
 
 [profile.dev.package."*"]
 opt-level = 3

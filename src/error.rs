@@ -34,7 +34,6 @@ impl Debug for Error {
 impl IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
         let ansi_string = format!("{:?}", self);
-        eprintln!("{}", ansi_string);
         let error = ansi_to_html::convert(&ansi_string).unwrap();
 
         (

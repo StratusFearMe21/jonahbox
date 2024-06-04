@@ -117,6 +117,7 @@ pub async fn play_handler(
     } else {
         let room = Arc::clone(config.value());
         let config = Arc::clone(&state.config);
+        let sender = state.tui_sender.clone();
         Ok(ws.protocols(["ecast-v0"])
             .on_upgrade(move |socket| async move {
                 match ws::connect_socket(socket, url_query, room).await.wrap_err("Failed to connect ecast client") {
@@ -125,7 +126,8 @@ pub async fn play_handler(
                         return;
                     }
                     Ok(connected) => {
-                        if let Err(e) = ws::handle_socket(Arc::clone(&connected.client), Arc::clone(&connected.room), connected.reconnected, connected.read_half, &config.doodles).await {
+                        sender.send(()).unwrap();
+                        if let Err(e) = ws::handle_socket(Arc::clone(&connected.client), Arc::clone(&connected.room), connected.reconnected, connected.read_half, &config.doodles, sender).await {
                             tracing::error!(id = connected.client.profile.id, role = ?connected.client.profile.role, code = connected.room.room_config.code, error = %e, "Error in WebSocket");
                             connected.client.disconnect().await;
                         } else {

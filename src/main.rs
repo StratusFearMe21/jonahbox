@@ -36,10 +36,7 @@ use rand_xoshiro::Xoshiro128PlusPlus;
 use reqwest::header::USER_AGENT;
 use serde::{de::Error, Deserialize, Serialize};
 use serde_json::json;
-use tokio::{
-    signal,
-    sync::{Mutex, Notify, RwLock},
-};
+use tokio::sync::{mpsc::UnboundedSender, Mutex, Notify, RwLock};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::instrument;
 use tracing_error::ErrorLayer;
@@ -53,6 +50,7 @@ mod entity;
 mod error;
 mod http_cache;
 mod tts;
+mod tui;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Token([u8; 12]);
@@ -135,6 +133,7 @@ struct State {
     room_map: Arc<DashMap<String, Arc<Room>>>,
     http_cache: http_cache::HttpCache,
     config: Arc<Config>,
+    tui_sender: UnboundedSender<()>,
 }
 
 #[derive(Deserialize)]
@@ -367,14 +366,19 @@ pub struct ConnectedSocket {
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let log_writer = tui::tracing_writer::TuiWriter::new(tx.clone());
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .event_format(log_writer.clone())
+        .with_writer(std::io::sink);
     tracing_subscriber::registry()
+        .with(ErrorLayer::default())
         .with(
             EnvFilter::try_from_default_env()
                 .or_else(|_| EnvFilter::try_new("info"))
                 .unwrap(),
         )
-        .with(tracing_subscriber::fmt::layer())
-        .with(ErrorLayer::default())
+        .with(fmt_layer)
         .init();
 
     let config_file =
@@ -398,6 +402,7 @@ async fn main() -> eyre::Result<()> {
     let css_query = tree_sitter::Query::new(&css_lang, "(plain_value) @frag")
         .wrap_err("css_query failed to build")?;
     let state = State {
+        tui_sender: tx,
         blobcast_host: Arc::new(RwLock::new(String::new())),
         room_map: Arc::new(DashMap::new()),
         http_cache: http_cache::HttpCache {
@@ -413,7 +418,7 @@ async fn main() -> eyre::Result<()> {
         config: Arc::new(config),
     };
 
-    let shutdown_state = state.clone();
+    let tui_state = state.clone();
 
     tokio::fs::create_dir_all(&state.config.doodles.path)
         .await
@@ -465,7 +470,7 @@ async fn main() -> eyre::Result<()> {
             .handle(handle.clone())
             .serve(app.into_make_service()),
         redirect_http_to_https(ports, handle.clone()),
-        shutdown_signal(shutdown_state, handle)
+        tui::tui(handle.clone(), tui_state, log_writer, rx),
     )?;
 
     Ok(())
@@ -587,40 +592,4 @@ async fn redirect_http_to_https(
     } else {
         Ok(())
     }
-}
-
-async fn shutdown_signal(state: State, handle: axum_server::Handle) -> Result<(), std::io::Error> {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-
-    tracing::info!("Received termination signal shutting down");
-    for room in state.room_map.iter() {
-        for connection in room.connections.iter() {
-            if let Some(socket) = connection.socket.lock().await.as_mut() {
-                socket.close().await.unwrap()
-            }
-        }
-    }
-    handle.graceful_shutdown(Some(Duration::from_secs(10))); // 10 secs is how long docker will wait
-                                                             // to force shutdown
-    Ok(())
 }

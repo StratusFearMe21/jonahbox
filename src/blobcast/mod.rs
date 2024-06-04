@@ -78,6 +78,7 @@ pub async fn play_handler(
         .into_response()
     } else {
         let room_map = Arc::clone(&state.room_map);
+        let sender = state.tui_sender.clone();
         ws
             .on_upgrade(move |socket| async move {
                 match ws::connect_socket(socket, Arc::clone(&room_map), state.config.accessible_host.clone()).await.wrap_err("Failed to connect blobcast socket") {
@@ -86,7 +87,8 @@ pub async fn play_handler(
                         return;
                     }
                     Ok(socket) => {
-                        if let Err(e) = ws::handle_socket(socket.read_half, Arc::clone(&socket.room), Arc::clone(&socket.client)).await {
+                        sender.send(()).unwrap();
+                        if let Err(e) = ws::handle_socket(socket.read_half, Arc::clone(&socket.room), Arc::clone(&socket.client), sender).await {
                             tracing::error!(id = socket.client.profile.id, role = ?socket.client.profile.role, error = %e, "Error in WebSocket");
                             socket.client.disconnect().await;
                         } else {

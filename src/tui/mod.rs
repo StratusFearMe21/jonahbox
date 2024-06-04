@@ -137,6 +137,7 @@ impl TuiState {
         self.room_qr.clear();
         let room = if let Some(selected) = self.rooms_list_state.selected() {
             let Some(room) = self.state.room_map.iter().nth(selected) else {
+                self.rooms_list_state.select(None);
                 return;
             };
             room
@@ -166,6 +167,7 @@ impl TuiState {
         .to_owned();
 
         self.state.room_map.remove(&room);
+        self.generate_room_qr();
     }
 }
 

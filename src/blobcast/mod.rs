@@ -42,6 +42,11 @@ pub const APP_TAGS: phf::Map<&'static str, &'static str> = phf::phf_map! {
     "25bcaae6-cada-4149-9947-5ef63f2aa2a4" => "splittheroom",
     "6a899966-4120-430c-9ae2-95f90767fa48" => "patentlystupid",
     "c72415bb-762a-df24-10f1-62dd419342a2" => "slingshoot",
+    "d4eab799-37ab-4649-b599-548442d081ce" => "triviadeath2",
+    "fe8be043-af2e-401f-8862-37fb386dfda7" => "rolemodels",
+    "3c424bfe-1208-4c05-a83d-6a1888b8477d" => "jokeboat",
+    "9364f2b4-e8e2-46ab-a8ad-71e0fce9e21b" => "ridictionary",
+    "ddebfee6-5bc0-4325-a2d5-c50856802f9f" => "pushthebutton"
 };
 
 #[derive(Deserialize, Serialize, Debug)]

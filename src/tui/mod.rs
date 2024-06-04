@@ -157,12 +157,12 @@ pub async fn tui(
         }
     }
 
+    tracing::info!("Received termination signal shutting down");
     disable_raw_mode()?;
     terminal
         .backend_mut()
         .queue(LeaveAlternateScreen)?
         .flush()?;
-    tracing::info!("Received termination signal shutting down");
     for room in tui_state.state.room_map.iter() {
         for connection in room.connections.iter() {
             if let Some(socket) = connection.socket.lock().await.as_mut() {

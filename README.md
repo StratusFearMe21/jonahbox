@@ -20,7 +20,7 @@ This project extends on the work of [InvoxiPlayGames](https://github.com/InvoxiP
 * The Jackbox Party Pack 7
 * The Jackbox Party Pack 8
 * The Jackbox Party Pack 9
-* The Jackbox Party Pack 10
+* The Jackbox Party Pack 10 (w/ Audience)
     * FixyText (does not work, and is probably a wontfix)
 * Drawful 2 International
 
@@ -34,7 +34,7 @@ This project extends on the work of [InvoxiPlayGames](https://github.com/InvoxiP
 ## Unimplemented features
 
 * Room passcodes
-* Audiences
+* Audiences (WIP)
 * Moderation features
 
 ## Usage

@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 
 use ratatui::{
-    layout::{Constraint, Layout},
-    widgets::{Block, Borders, List, Paragraph, Tabs, Widget},
+    layout::{Constraint, Layout, Rect},
+    style::{Modifier, Style, Stylize},
+    widgets::{Block, Borders, List, Paragraph, StatefulWidget, Tabs, Widget},
 };
 
-use super::RoomTabs;
+use super::{AppFocus, RoomTabs};
 
 pub struct RoomView<'a>(pub &'a mut super::TuiState);
 
@@ -22,40 +23,65 @@ impl<'a> Widget for RoomView<'a> {
         Tabs::new(RoomTabs::list())
             .select(self.0.room_tab as usize)
             .render(split[0], buf);
+        let mut block = Block::new().borders(Borders::all());
+        if self.0.app_focus == AppFocus::EntityList {
+            block = block.border_style(Style::new().dim().green());
+        }
         match self.0.room_tab {
             RoomTabs::QRCode => {
-                Paragraph::new(self.0.room_qr.as_str())
+                Paragraph::new(self.0.generate_room_qr())
                     .alignment(ratatui::layout::Alignment::Center)
                     .render(split[1], buf);
             }
             RoomTabs::Entities => {
-                let room = if let Some(selected) = self.0.rooms_list_state.selected() {
-                    let Some(room) = self.0.state.room_map.iter().nth(selected) else {
-                        return;
-                    };
-                    room
-                } else {
+                let Some(room) = self.0.selected_room() else {
                     return;
                 };
-                List::new(
+                let list = List::new(
                     room.entities
                         .iter()
                         .map(|e| e.key().to_owned())
                         .collect::<Vec<_>>(),
                 )
-                .block(Block::new().borders(Borders::all()))
-                .render(split[1], buf);
+                .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+                .highlight_symbol(">> ")
+                .block(block);
+                if self
+                    .0
+                    .rooms_entity_list_state
+                    .selected()
+                    .is_some_and(|l| list.len() <= l)
+                {
+                    self.0.rooms_entity_list_state.select(None);
+                }
+                let new_split = Layout::new(
+                    ratatui::layout::Direction::Horizontal,
+                    [Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)],
+                )
+                .split(split[1]);
+                let alt_split = [split[1], Rect::ZERO];
+                let split = if self.0.rooms_entity_list_state.selected().is_some() {
+                    new_split.as_ref()
+                } else {
+                    &alt_split
+                };
+                StatefulWidget::render(list, split[0], buf, &mut self.0.rooms_entity_list_state);
+                if split[1] != Rect::ZERO {
+                    let entity = room
+                        .entities
+                        .iter()
+                        .nth(self.0.rooms_entity_list_state.selected().unwrap())
+                        .unwrap();
+                    Paragraph::new(serde_json::to_string_pretty(entity.value()).unwrap())
+                        .block(Block::new().borders(Borders::all()))
+                        .render(split[1], buf)
+                }
             }
             RoomTabs::Players => {
-                let room = if let Some(selected) = self.0.rooms_list_state.selected() {
-                    let Some(room) = self.0.state.room_map.iter().nth(selected) else {
-                        return;
-                    };
-                    room
-                } else {
+                let Some(room) = self.0.selected_room() else {
                     return;
                 };
-                List::new(
+                let list = List::new(
                     room.connections
                         .iter()
                         .map(|e| {
@@ -67,8 +93,29 @@ impl<'a> Widget for RoomView<'a> {
                         })
                         .collect::<Vec<_>>(),
                 )
-                .block(Block::new().borders(Borders::all()))
-                .render(split[1], buf);
+                .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+                .highlight_symbol(">> ")
+                .block(block);
+                if self
+                    .0
+                    .rooms_entity_list_state
+                    .selected()
+                    .is_some_and(|l| list.len() <= l)
+                {
+                    self.0.rooms_entity_list_state.select(None);
+                }
+                let new_split = Layout::new(
+                    ratatui::layout::Direction::Horizontal,
+                    [Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)],
+                )
+                .split(split[1]);
+                let alt_split = [split[1], Rect::ZERO];
+                let split = if self.0.rooms_entity_list_state.selected().is_some() {
+                    new_split.as_ref()
+                } else {
+                    &alt_split
+                };
+                StatefulWidget::render(list, split[0], buf, &mut self.0.rooms_entity_list_state);
             }
         }
     }

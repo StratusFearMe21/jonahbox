@@ -109,7 +109,8 @@ pub async fn play_handler(
                 serde_urlencoded::to_string(&url_query.0).unwrap()
             );
             async move {
-                if let Err(e) = ws::handle_socket_proxy(host, socket, ecast_req).await {
+                if let Err(e) = ws::handle_socket_proxy(host, socket, ecast_req, url_query.0).await
+                {
                     tracing::error!(error = %e, "Failed to proxy ecast client");
                 }
             }
@@ -214,8 +215,8 @@ pub async fn rooms_handler(
                 code: code.clone(),
                 host,
                 audience_host: state.config.accessible_host.clone(),
-                locked: false,
-                full: false,
+                locked: false.into(),
+                full: false.into(),
                 moderation_enabled: false,
                 password_required: false,
                 twitch_locked: false, // unimplemented
@@ -223,7 +224,7 @@ pub async fn rooms_handler(
                 keepalive: false,
             },
             exit: Notify::new(),
-            channel: tokio::sync::watch::channel(()),
+            channel: tokio::sync::watch::channel(()).0,
         }),
     );
 

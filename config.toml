@@ -1,5 +1,8 @@
 # The host which your Jackbox games can access (through HTTPS)
 accessible_host = "192.168.1.10"
+# Whether the TUI should be ran when running this server, set
+# to false if this server is to be run as a daemon
+tui = false
 
 # Controls how the HTTP cache for `jackbox.tv` functions
 [cache]
@@ -51,15 +54,15 @@ op_mode = "native"
 [ecast]
 # Any connections that go through in proxy mode will be proxied to the `server_url`
 #
-# op_mode = "proxy"
+op_mode = "proxy"
 #
 # Native mode means that all games are handled by *this* server implementation
 #
-op_mode = "native"
+# op_mode = "native"
 #
 # The jackbox server to proxy to, only matters if op_mode="proxy"
-# server_url = "https://ecast.jackboxgames.com"
-server_url = "http://192.168.1.10:8888"
+server_url = "https://ecast.jackboxgames.com"
+# server_url = "http://192.168.1.10:8888"
 
 # Same situation as the ecast configuration, but for the older API
 [blobcast]

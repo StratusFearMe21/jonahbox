@@ -283,8 +283,8 @@ pub async fn access_token_handler(
                         code: token_req.room_id.clone(),
                         host: state.blobcast_host.read().await.clone(),
                         audience_host: state.config.ecast.server_url.clone().unwrap_or_default(),
-                        locked: false,
-                        full: false,
+                        locked: false.into(),
+                        full: false.into(),
                         moderation_enabled: false,
                         password_required: false,
                         twitch_locked: false,
@@ -292,7 +292,7 @@ pub async fn access_token_handler(
                         keepalive: false,
                     },
                     exit: Notify::new(),
-                    channel: tokio::sync::watch::channel(()),
+                    channel: tokio::sync::watch::channel(()).0,
                 }),
             );
 

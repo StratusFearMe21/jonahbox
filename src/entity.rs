@@ -4,6 +4,7 @@ use std::{
 };
 
 use color_eyre::eyre::{self, ContextCompat};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use tokio::io::Interest;
@@ -19,19 +20,47 @@ pub struct JBEntity(pub JBType, pub JBObject, pub JBAttributes);
 #[serde(rename_all = "camelCase")]
 pub struct JBObject {
     pub key: String,
-    pub val: Option<JBValue>,
+    #[serde(flatten)]
+    #[serde(default)]
+    pub val: JBValue,
     pub restrictions: JBRestrictions,
     pub version: u32,
     pub from: AtomicI64,
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Debug)]
 #[serde(untagged)]
 pub enum JBValue {
-    Text(String),
-    Number(f64),
-    Object(serde_json::Map<String, serde_json::Value>),
-    Doodle(JBDoodle),
+    Text {
+        val: String,
+    },
+    Number {
+        val: f64,
+    },
+    Object {
+        val: serde_json::Map<String, serde_json::Value>,
+    },
+    Doodle {
+        val: JBDoodle,
+    },
+    AudiencePnCounter {
+        count: AtomicI64,
+    },
+    AudienceGCounter {
+        count: AtomicI64,
+    },
+    AudienceCountGroup {
+        choices: DashMap<String, AtomicI64>,
+    },
+    None {
+        val: Option<()>,
+    },
+}
+
+impl Default for JBValue {
+    fn default() -> Self {
+        Self::None { val: None }
+    }
 }
 
 #[derive(Serialize, Debug, Clone, Copy)]
@@ -41,6 +70,12 @@ pub enum JBType {
     Number,
     Object,
     Doodle,
+    #[serde(rename = "audience/g-counter")]
+    AudienceGCounter,
+    #[serde(rename = "audience/pn-counter")]
+    AudiencePnCounter,
+    #[serde(rename = "audience/count-group")]
+    AudienceCountGroup,
 }
 
 impl JBType {
@@ -50,6 +85,9 @@ impl JBType {
             Self::Number => "number",
             Self::Object => "object",
             Self::Doodle => "doodle",
+            Self::AudiencePnCounter => "audience/pn-counter",
+            Self::AudienceGCounter => "audience/g-counter",
+            Self::AudienceCountGroup => "audience/count-group",
         }
     }
 }
@@ -73,13 +111,13 @@ pub struct JBRestrictions {
     #[serde(default)]
     #[serde(skip_serializing_if = "String::is_empty")]
     #[serde(rename = "type")]
-    data_type: String,
+    pub data_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    min: Option<f64>,
+    pub min: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max: Option<f64>,
+    pub max: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    increment: Option<f64>,
+    pub increment: Option<f64>,
 }
 
 #[derive(Serialize, Debug)]
@@ -88,6 +126,15 @@ pub struct JBAttributes {
     pub locked: AtomicBool,
     #[serde(skip)]
     pub acl: Vec<Acl>,
+}
+
+impl Default for JBAttributes {
+    fn default() -> Self {
+        Self {
+            locked: false.into(),
+            acl: Acl::default_vec(),
+        }
+    }
 }
 
 impl JBAttributes {

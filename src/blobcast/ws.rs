@@ -204,8 +204,8 @@ pub async fn connect_socket(
             code: room_code.clone(),
             audience_host: host.clone(),
             host,
-            locked: false,
-            full: false,
+            locked: false.into(),
+            full: false.into(),
             moderation_enabled: false,
             password_required: false,
             twitch_locked: false,
@@ -213,7 +213,7 @@ pub async fn connect_socket(
             keepalive: false,
         },
         exit: Notify::new(),
-        channel: tokio::sync::watch::channel(()),
+        channel: tokio::sync::watch::channel(()).0,
     });
 
     room_map.insert(room_code.clone(), Arc::clone(&room));
@@ -314,7 +314,7 @@ pub async fn handle_socket(
                 break
             }
         }
-        room.channel.0.send(()).unwrap();
+        room.channel.send_replace(());
     }
 
     Ok(())
@@ -334,15 +334,15 @@ async fn process_message(
                     JBType::Object,
                     JBObject {
                         key: "bc:room".to_owned(),
-                        val: Some(JBValue::Object(
-                            message
+                        val: JBValue::Object {
+                            val: message
                                 .args
                                 .get_args()
                                 .blob
                                 .as_object()
                                 .cloned()
                                 .ok_or_eyre("No blob in SetRoomBlob message")?,
-                        )),
+                        },
                         restrictions: JBRestrictions::default(),
                         version: prev_value
                             .as_ref()
@@ -350,10 +350,7 @@ async fn process_message(
                             .unwrap_or_default(),
                         from: client.profile.id.into(),
                     },
-                    JBAttributes {
-                        locked: false.into(),
-                        acl: Acl::default_vec(),
-                    },
+                    JBAttributes::default(),
                 )
             };
             let value = JBResult::Object(&entity.1);
@@ -420,15 +417,15 @@ async fn process_message(
                     JBType::Object,
                     JBObject {
                         key: key.clone(),
-                        val: Some(JBValue::Object(
-                            message
+                        val: JBValue::Object {
+                            val: message
                                 .args
                                 .get_args()
                                 .blob
                                 .as_object()
                                 .cloned()
                                 .ok_or_eyre("No blob in SetCustomerBlob message")?,
-                        )),
+                        },
                         restrictions: JBRestrictions::default(),
                         version: prev_value
                             .as_ref()

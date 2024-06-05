@@ -5,7 +5,7 @@ use std::{
     ops::DerefMut,
     path::PathBuf,
     sync::{
-        atomic::{AtomicI64, AtomicU64},
+        atomic::{AtomicBool, AtomicI64, AtomicU64},
         Arc,
     },
     time::Duration,
@@ -36,10 +36,7 @@ use rand_xoshiro::Xoshiro128PlusPlus;
 use reqwest::header::USER_AGENT;
 use serde::{de::Error, Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{
-    watch::{Receiver, Sender},
-    Mutex, Notify, RwLock,
-};
+use tokio::sync::{watch::Sender, Mutex, Notify, RwLock};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::instrument;
 use tracing_error::ErrorLayer;
@@ -153,6 +150,7 @@ struct Config {
     blobcast: Ecast,
     tls: Tls,
     tts: TTSConfig,
+    tui: bool,
     ports: Ports,
     cache: CacheConfig,
     accessible_host: String,
@@ -206,7 +204,7 @@ pub enum CacheMode {
     Offline,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct JBRoom {
     pub app_id: String,
@@ -215,13 +213,36 @@ pub struct JBRoom {
     pub code: String,
     pub host: String,
     pub audience_host: String,
-    pub locked: bool,
-    pub full: bool,
+    pub locked: AtomicBool,
+    pub full: AtomicBool,
     pub moderation_enabled: bool,
     pub password_required: bool,
     pub twitch_locked: bool,
     pub locale: Cow<'static, str>,
     pub keepalive: bool,
+}
+
+impl Clone for JBRoom {
+    fn clone(&self) -> Self {
+        Self {
+            app_id: self.app_id.clone(),
+            app_tag: self.app_tag.clone(),
+            audience_enabled: self.audience_enabled,
+            code: self.code.clone(),
+            host: self.host.clone(),
+            audience_host: self.audience_host.clone(),
+            locked: self
+                .locked
+                .load(std::sync::atomic::Ordering::Acquire)
+                .into(),
+            full: self.full.load(std::sync::atomic::Ordering::Acquire).into(),
+            moderation_enabled: self.moderation_enabled,
+            password_required: self.password_required,
+            twitch_locked: self.twitch_locked,
+            locale: self.locale.clone(),
+            keepalive: self.keepalive,
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -247,6 +268,7 @@ pub struct JBProfile {
 pub enum JBProfileRoles {
     Host {},
     Player { name: String },
+    None,
 }
 
 #[derive(Debug)]
@@ -264,14 +286,9 @@ impl Client {
 
         tracing::debug!(?message, "Sending WS Message");
 
-        if let Err(e) = self
-            .send_ws_message(Message::Text(
-                serde_json::to_string(&message).wrap_err_with(|| {
-                    format!("Failed to serialize ecast message: {:?}", &message)
-                })?,
-            ))
-            .await
-        {
+        let json_message = serde_json::to_string(&message)
+            .wrap_err_with(|| format!("Failed to serialize ecast message: {:?}", &message))?;
+        if let Err(e) = self.send_ws_message(Message::Text(json_message)).await {
             self.disconnect().await;
             return Err(e)
                 .wrap_err_with(|| format!("Ecast message failed to send: {:?}", &message));
@@ -357,16 +374,20 @@ pub struct Room {
     pub room_serial: AtomicI64,
     pub room_config: JBRoom,
     pub exit: Notify,
-    pub channel: (Sender<()>, Receiver<()>),
+    pub channel: Sender<()>,
 }
 
 impl Room {
-    async fn close(&self) {
-        for connection in self.connections.iter() {
+    async fn close(&self) -> Result<(), axum::Error> {
+        futures_util::future::try_join_all(self.connections.iter().map(|connection| async move {
             if let Some(socket) = connection.socket.lock().await.as_mut() {
-                socket.close().await.unwrap()
+                socket.close().await
+            } else {
+                Ok(())
             }
-        }
+        }))
+        .await?;
+        Ok(())
     }
 }
 
@@ -380,20 +401,6 @@ pub struct ConnectedSocket {
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
-    let (tx, rx) = tokio::sync::watch::channel(());
-    let log_writer = tui::tracing_writer::TuiWriter::new(tx.clone());
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .event_format(log_writer.clone())
-        .with_writer(std::io::sink);
-    tracing_subscriber::registry()
-        .with(ErrorLayer::default())
-        .with(
-            EnvFilter::try_from_default_env()
-                .or_else(|_| EnvFilter::try_new("info"))
-                .unwrap(),
-        )
-        .with(fmt_layer)
-        .init();
 
     let config_file =
         std::fs::read_to_string("config.toml").wrap_err("Could not read config.toml")?;
@@ -415,8 +422,9 @@ async fn main() -> eyre::Result<()> {
     let css_lang = tree_sitter_css::language();
     let css_query = tree_sitter::Query::new(&css_lang, "(plain_value) @frag")
         .wrap_err("css_query failed to build")?;
+    let (tx, rx) = tokio::sync::watch::channel(());
     let state = State {
-        tui_sender: tx,
+        tui_sender: tx.clone(),
         blobcast_host: Arc::new(RwLock::new(String::new())),
         room_map: Arc::new(DashMap::new()),
         http_cache: http_cache::HttpCache {
@@ -432,7 +440,35 @@ async fn main() -> eyre::Result<()> {
         config: Arc::new(config),
     };
 
+    let handle = axum_server::Handle::new();
+    let tracing_registry = tracing_subscriber::registry()
+        .with(ErrorLayer::default())
+        .with(
+            EnvFilter::try_from_default_env()
+                .or_else(|_| EnvFilter::try_new("info"))
+                .unwrap(),
+        );
     let tui_state = state.clone();
+    let tui_future = if state.config.tui {
+        let log_writer = tui::tracing_writer::TuiWriter::new(tx);
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .event_format(log_writer.clone())
+            .with_writer(std::io::sink);
+        tracing_registry.with(fmt_layer).init();
+
+        tui::tui(
+            handle.clone(),
+            tui_state,
+            Some(log_writer),
+            rx,
+            state.config.tui,
+        )
+    } else {
+        tracing_registry
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+        tui::tui(handle.clone(), tui_state, None, rx, state.config.tui)
+    };
 
     tokio::fs::create_dir_all(&state.config.doodles.path)
         .await
@@ -470,8 +506,6 @@ async fn main() -> eyre::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let handle = axum_server::Handle::new();
-
     let addr = SocketAddr::from(([0, 0, 0, 0], ports.https));
     tracing::info!("Ecast listening on {}", addr);
     let blobcast_addr = SocketAddr::from(([0, 0, 0, 0], ports.blobcast));
@@ -484,7 +518,7 @@ async fn main() -> eyre::Result<()> {
             .handle(handle.clone())
             .serve(app.into_make_service()),
         redirect_http_to_https(ports, handle.clone()),
-        tui::tui(handle.clone(), tui_state, log_writer, rx),
+        tui_future,
     )?;
 
     Ok(())

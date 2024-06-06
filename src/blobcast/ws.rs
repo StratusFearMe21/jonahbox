@@ -3,14 +3,14 @@ use std::{
     io::{Read, Write},
     process::Stdio,
     str::FromStr,
-    sync::Arc,
+    sync::{atomic::AtomicI64, Arc},
     time::Duration,
 };
 
 use crate::{
     acl::{Acl, Role},
     ecast::ws::JBResult,
-    entity::{JBAttributes, JBEntity, JBObject, JBRestrictions, JBType, JBValue},
+    entity::{JBAttributes, JBCountGroup, JBEntity, JBObject, JBRestrictions, JBType, JBValue},
     Client, ClientType, ConnectedSocket, JBProfile, Room, Token,
 };
 
@@ -18,7 +18,8 @@ use axum::extract::ws::{Message, WebSocket};
 use color_eyre::eyre::{self, bail, eyre, OptionExt, WrapErr};
 use dashmap::DashMap;
 use futures_util::{stream::SplitStream, SinkExt, StreamExt, TryStreamExt};
-use serde::{Deserialize, Serialize};
+use indexmap::IndexMap;
+use serde::{de::IgnoredAny, Deserialize, Serialize};
 use tokio::{
     io::Interest,
     sync::{Mutex, Notify},
@@ -61,80 +62,180 @@ impl<'a> FromStr for WSMessage<'a> {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-pub struct JBMessage<'a> {
-    pub name: Cow<'a, str>,
-    pub args: JBMessageArgs<'a>,
+#[derive(Deserialize, Debug)]
+#[serde(tag = "name", content = "args")]
+#[serde(rename_all = "camelCase")]
+pub enum JBMessage<'a> {
+    Msg(JBMessageArgs<'a>),
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-#[serde(untagged)]
+#[derive(Serialize, Debug)]
+#[serde(tag = "name", content = "args")]
+#[serde(rename_all = "camelCase")]
+pub enum JBResponse<'a> {
+    Msg([JBResponseArgs<'a>; 1]),
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+#[serde(tag = "type")]
 pub enum JBMessageArgs<'a> {
-    Object(JBArgs<'a>),
-    Array([JBArgs<'a>; 1]),
+    #[serde(rename_all = "camelCase")]
+    Action {
+        app_id: Cow<'a, str>,
+        user_id: Cow<'a, str>,
+        #[serde(flatten)]
+        action: JBAction<'a>,
+    },
 }
 
-impl<'a> JBMessageArgs<'a> {
-    pub fn get_args(&self) -> &JBArgs<'a> {
-        match self {
-            JBMessageArgs::Object(a) => a,
-            JBMessageArgs::Array(a) => &a[0],
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+#[serde(tag = "type")]
+pub enum JBResponseArgs<'a> {
+    #[serde(rename_all = "camelCase")]
+    Event {
+        room_id: Cow<'a, str>,
+        #[serde(flatten)]
+        event: JBEvent<'a>,
+    },
+    Result {
+        #[serde(flatten)]
+        result: JBResultAction<'a>,
+        success: bool,
+    },
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+#[serde(tag = "action")]
+pub enum JBAction<'a> {
+    #[serde(rename_all = "camelCase")]
+    CreateRoom { options: serde_json::Value },
+    #[serde(rename_all = "camelCase")]
+    SetRoomBlob {
+        blob: serde_json::Map<String, serde_json::Value>,
+        room_id: Cow<'a, str>,
+    },
+    #[serde(rename_all = "camelCase")]
+    SetCustomerBlob {
+        blob: serde_json::Map<String, serde_json::Value>,
+        customer_user_id: Cow<'a, str>,
+        room_id: Cow<'a, str>,
+    },
+    #[serde(rename_all = "camelCase")]
+    StartSession {
+        #[serde(flatten)]
+        module: JBSessionModuleWithArgs,
+        name: Cow<'a, str>,
+        room_id: Cow<'a, str>,
+    },
+    #[serde(rename_all = "camelCase")]
+    StopSession {
+        module: JBSessionModule,
+        name: Cow<'a, str>,
+        room_id: Cow<'a, str>,
+    },
+    #[serde(rename_all = "camelCase")]
+    GetSessionStatus {
+        module: JBSessionModule,
+        name: Cow<'a, str>,
+        room_id: Cow<'a, str>,
+    },
+    #[serde(rename_all = "camelCase")]
+    LockRoom { room_id: Cow<'a, str> },
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+#[serde(tag = "action")]
+pub enum JBResultAction<'a> {
+    #[serde(rename_all = "camelCase")]
+    CreateRoom { room_id: Cow<'a, str> },
+    #[serde(rename_all = "camelCase")]
+    SetRoomBlob {},
+    #[serde(rename_all = "camelCase")]
+    LockRoom { room_id: Cow<'a, str> },
+    #[serde(rename_all = "camelCase")]
+    GetSessionStatus {
+        #[serde(flatten)]
+        module: JBSessionModuleWithResponse<'a>,
+        name: Cow<'a, str>,
+    },
+    #[serde(rename_all = "camelCase")]
+    StartSession {
+        #[serde(flatten)]
+        module: JBSessionModuleWithResponse<'a>,
+        name: Cow<'a, str>,
+    },
+    #[serde(rename_all = "camelCase")]
+    StopSession {
+        #[serde(flatten)]
+        module: JBSessionModuleWithResponse<'a>,
+        name: Cow<'a, str>,
+    },
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+#[serde(tag = "module", content = "options")]
+pub enum JBSessionModuleWithArgs {
+    Audience(IgnoredAny),
+    Vote(JBCountGroup),
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+#[serde(tag = "module", content = "response")]
+pub enum JBSessionModuleWithResponse<'a> {
+    Audience(&'a JBValue),
+    Vote(&'a IndexMap<String, AtomicI64>),
+}
+
+impl From<JBSessionModuleWithArgs> for JBSessionModule {
+    fn from(value: JBSessionModuleWithArgs) -> Self {
+        match value {
+            JBSessionModuleWithArgs::Audience(_) => Self::Audience,
+            JBSessionModuleWithArgs::Vote(_) => Self::Vote,
         }
     }
 }
 
-fn object_is_empty(v: &serde_json::Value) -> bool {
-    match v {
-        serde_json::Value::Null => true,
-        serde_json::Value::String(s) => s.is_empty(),
-        serde_json::Value::Array(a) => a.is_empty(),
-        serde_json::Value::Object(o) => o.is_empty(),
-        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
-    }
-}
-
-#[derive(Deserialize, Serialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct JBArgs<'a> {
-    #[serde(default)]
-    #[serde(skip_serializing_if = "str::is_empty")]
-    pub action: Cow<'a, str>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "str::is_empty")]
-    pub event: Cow<'a, str>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub app_id: String,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "object_is_empty")]
-    pub options: serde_json::Value,
-    #[serde(rename = "type")]
-    #[serde(skip_serializing_if = "str::is_empty")]
-    pub arg_type: Cow<'a, str>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "object_is_empty")]
-    pub blob: serde_json::Value,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "object_is_empty")]
-    pub message: serde_json::Value,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "str::is_empty")]
-    pub user_id: Cow<'a, str>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "str::is_empty")]
-    pub customer_user_id: Cow<'a, str>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "str::is_empty")]
-    pub customer_name: Cow<'a, str>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "str::is_empty")]
-    pub room_id: Cow<'a, str>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub success: Option<bool>,
+pub enum JBSessionModule {
+    Audience,
+    Vote,
 }
 
-#[instrument(skip(room_map))]
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+#[serde(tag = "event")]
+pub enum JBEvent<'a> {
+    #[serde(rename_all = "camelCase")]
+    RoomBlobChanged { blob: serde_json::Value },
+    #[serde(rename_all = "camelCase")]
+    CustomerJoinedRoom {
+        customer_user_id: Cow<'a, str>,
+        customer_name: Cow<'a, str>,
+        options: JBCustomerOptions<'a>,
+    },
+    #[serde(rename_all = "camelCase")]
+    CustomerMessage {
+        user_id: Cow<'a, str>,
+        message: serde_json::Value,
+    },
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct JBCustomerOptions<'a> {
+    pub roomcode: Cow<'a, str>,
+    pub name: Cow<'a, str>,
+    pub email: Cow<'a, str>,
+    pub phone: Cow<'a, str>,
+}
+
+#[instrument(skip(room_map, socket))]
 pub async fn connect_socket(
     socket: WebSocket,
     room_map: Arc<DashMap<String, Arc<Room>>>,
@@ -145,7 +246,7 @@ pub async fn connect_socket(
     ws_write
         .send(Message::Text("1::".to_owned()))
         .await
-        .wrap_err("Failed to send blobcast connection message: ::1")?;
+        .wrap_err("Failed to send blobcast connection message: 1::")?;
 
     let create_room_msg = ws_read
         .next()
@@ -160,12 +261,21 @@ pub async fn connect_socket(
         );
     };
 
-    let create_room = WSMessage::from_str(&create_room).wrap_err_with(|| {
-        format!(
-            "Failed to deserialize CreateRoom WS Message: {}",
-            create_room
-        )
-    })?;
+    let create_room = WSMessage::from_str(&create_room)
+        .wrap_err("Failed to deserialize CreateRoom WS Message")?;
+
+    let JBMessage::Msg(JBMessageArgs::Action {
+        app_id,
+        user_id,
+        action: JBAction::CreateRoom { .. },
+        ..
+    }) = create_room
+        .message
+        .as_ref()
+        .ok_or_else(|| eyre!("CreateRoom contained no message: {:?}", create_room))?
+    else {
+        bail!("Expected CreateRoom messages, got: {:?}", create_room);
+    };
 
     let room_code = crate::room_id();
 
@@ -175,15 +285,6 @@ pub async fn connect_socket(
         room_serial: 1.into(),
         room_config: crate::JBRoom {
             app_tag: {
-                let app_id = create_room
-                    .message
-                    .as_ref()
-                    .ok_or_else(|| eyre!("CreateRoom contained no message: {:?}", create_room))?
-                    .args
-                    .get_args()
-                    .app_id
-                    .as_str();
-
                 super::APP_TAGS
                     .get(app_id)
                     .map(|s| s.to_string())
@@ -192,15 +293,8 @@ pub async fn connect_socket(
                         String::new()
                     })
             },
-            app_id: create_room
-                .message
-                .as_ref()
-                .ok_or_else(|| eyre!("CreateRoom contained no message: {:?}", create_room))?
-                .args
-                .get_args()
-                .app_id
-                .clone(),
-            audience_enabled: false,
+            app_id: app_id.clone().into_owned(),
+            audience_enabled: true,
             code: room_code.clone(),
             audience_host: host.clone(),
             host,
@@ -218,24 +312,6 @@ pub async fn connect_socket(
 
     room_map.insert(room_code.clone(), Arc::clone(&room));
 
-    ws_write
-        .send(Message::Text(format!(
-            "5:::{{\
-                \"name\": \"msg\",\
-                \"args\": [\
-                    {{\
-                        \"type\": \"Result\",\
-                        \"action\": \"CreateRoom\",\
-                        \"success\": true,\
-                        \"roomId\": \"{}\"\
-                    }}\
-                ]\
-            }}",
-            room_code
-        )))
-        .await
-        .wrap_err("Failed to send result of CreateRoom")?;
-
     let serial = room
         .room_serial
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -243,15 +319,7 @@ pub async fn connect_socket(
     let profile = JBProfile {
         id: serial,
         roles: crate::JBProfileRoles::Host {},
-        user_id: create_room
-            .message
-            .as_ref()
-            .ok_or_else(|| eyre!("CreateRoom contained no message: {:?}", create_room))?
-            .args
-            .get_args()
-            .user_id
-            .clone()
-            .into_owned(),
+        user_id: user_id.clone().into_owned(),
         role: Role::Host,
         name: String::new(),
     };
@@ -263,6 +331,17 @@ pub async fn connect_socket(
         client_type: ClientType::Blobcast,
         secret: Token::random(),
     });
+
+    client
+        .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+            result: JBResultAction::CreateRoom {
+                room_id: Cow::Owned(room_code),
+            },
+            success: true,
+        }]))
+        .await
+        .wrap_err("Failed to send host the room code")?;
+
     room.connections.insert(serial, Arc::clone(&client));
     Ok(ConnectedSocket {
         client,
@@ -293,7 +372,7 @@ pub async fn handle_socket(
                             }
                             _ => continue,
                         };
-                        if let Some(ref message) = message.message {
+                        if let Some(message) = message.message {
                             process_message(&client, message, &room).await
                                 .wrap_err("Failed to process message")?;
                         }
@@ -321,157 +400,299 @@ pub async fn handle_socket(
 }
 
 #[instrument(skip(client, room))]
-async fn process_message(
-    client: &Client,
-    message: &JBMessage<'_>,
-    room: &Room,
-) -> eyre::Result<()> {
-    match message.args.get_args().action.as_ref() {
-        "SetRoomBlob" => {
-            let entity = {
-                let prev_value = room.entities.get("bc:room");
-                JBEntity(
-                    JBType::Object,
-                    JBObject {
-                        key: "bc:room".to_owned(),
-                        val: JBValue::Object {
-                            val: message
-                                .args
-                                .get_args()
-                                .blob
-                                .as_object()
-                                .cloned()
-                                .ok_or_eyre("No blob in SetRoomBlob message")?,
+async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -> eyre::Result<()> {
+    match message {
+        JBMessage::Msg(JBMessageArgs::Action {
+            app_id,
+            user_id,
+            action,
+        }) => match action {
+            JBAction::SetRoomBlob { blob, room_id } => {
+                let entity = {
+                    let prev_value = room.entities.get("bc:room");
+                    JBEntity(
+                        JBType::Object,
+                        JBObject {
+                            key: "bc:room".to_owned(),
+                            val: JBValue::Object { val: blob },
+                            restrictions: JBRestrictions::default(),
+                            version: prev_value
+                                .as_ref()
+                                .map(|p| p.value().1.version + 1)
+                                .unwrap_or_default(),
+                            from: client.profile.id.into(),
                         },
-                        restrictions: JBRestrictions::default(),
-                        version: prev_value
-                            .as_ref()
-                            .map(|p| p.value().1.version + 1)
-                            .unwrap_or_default(),
-                        from: client.profile.id.into(),
-                    },
-                    JBAttributes::default(),
-                )
-            };
-            let value = JBResult::Object(&entity.1);
-            for client in room.connections.iter() {
-                match client.client_type {
-                    ClientType::Ecast => {
-                        client
-                            .send_ecast(crate::ecast::ws::JBMessage {
-                                pc: 0,
-                                re: None,
-                                result: &value,
-                            })
-                            .await
-                            .wrap_err("Failed to send room blob to ecast client")?;
-                    }
-                    ClientType::Blobcast => {
-                        client
-                            .send_blobcast(JBMessage {
-                                name: Cow::Borrowed("msg"),
-                                args: JBMessageArgs::Array([JBArgs {
-                                    arg_type: Cow::Borrowed("Event"),
-                                    action: Cow::Borrowed("RoomBlobChanged"),
-                                    room_id: Cow::Borrowed(&room.room_config.code),
-                                    blob: serde_json::to_value(&entity.1.val).wrap_err_with(
-                                        || {
-                                            format!(
-                                            "Failed to convert entity to serde_json::Value: {:?}",
-                                            entity.1.val
-                                        )
+                        JBAttributes::default(),
+                    )
+                };
+                let value = JBResult::Object(&entity.1);
+                for client in room.connections.iter() {
+                    match client.client_type {
+                        ClientType::Ecast => {
+                            client
+                                .send_ecast(crate::ecast::ws::JBMessage {
+                                    pc: 0,
+                                    re: None,
+                                    result: &value,
+                                })
+                                .await
+                                .wrap_err("Failed to send room blob to ecast client")?;
+                        }
+                        ClientType::Blobcast => {
+                            client
+                                .send_blobcast(JBResponse::Msg(
+                                     [JBResponseArgs::Event {
+                                        room_id: Cow::Borrowed(&room.room_config.code),
+                                        event: JBEvent::RoomBlobChanged {
+                                            blob: serde_json::to_value(&entity.1.val)
+                                                .wrap_err_with(|| {
+                                                    format!(
+                                                        "Failed to convert entity to serde_json::Value: {:?}",
+                                                        entity.1.val
+                                                    )
+                                                })?,
                                         },
-                                    )?,
-                                    ..Default::default()
-                                }]),
-                            })
-                            .await
-                            .wrap_err("Failed to ACK RoomBlob to blobcast host")?;
+                                    }],
+                                ))
+                                .await
+                                .wrap_err("Failed to ACK RoomBlob to blobcast host")?;
+                        }
                     }
                 }
-            }
-            room.entities.insert("bc:room".to_owned(), entity);
-            client
-                .send_blobcast(JBMessage {
-                    name: Cow::Borrowed("msg"),
-                    args: JBMessageArgs::Array([JBArgs {
-                        arg_type: Cow::Borrowed("Result"),
-                        action: Cow::Borrowed("SetRoomBlob"),
-                        success: Some(true),
-                        ..Default::default()
-                    }]),
-                })
-                .await
-                .wrap_err("Failed to send result of SetRoomBlob")?;
-        }
-        "SetCustomerBlob" => {
-            let user_id = message.args.get_args().customer_user_id.as_ref();
-            let key = format!("bc:customer:{}", user_id);
-            let connection = room
-                .connections
-                .iter()
-                .find(|c| c.profile.user_id == user_id);
-            let entity = {
-                let prev_value = room.entities.get(&key);
-                JBEntity(
-                    JBType::Object,
-                    JBObject {
-                        key: key.clone(),
-                        val: JBValue::Object {
-                            val: message
-                                .args
-                                .get_args()
-                                .blob
-                                .as_object()
-                                .cloned()
-                                .ok_or_eyre("No blob in SetCustomerBlob message")?,
-                        },
-                        restrictions: JBRestrictions::default(),
-                        version: prev_value
-                            .as_ref()
-                            .map(|p| p.value().1.version + 1)
-                            .unwrap_or_default(),
-                        from: client.profile.id.into(),
-                    },
-                    JBAttributes {
-                        locked: false.into(),
-                        acl: vec![Acl {
-                            interest: Interest::READABLE,
-                            principle: crate::acl::Principle::Id(
-                                connection.as_ref().map(|c| *c.key()).unwrap_or_default(),
-                            ),
-                        }],
-                    },
-                )
-            };
-            if let Some(connection) = connection {
-                connection
-                    .send_ecast(crate::ecast::ws::JBMessage {
-                        pc: 0,
-                        re: None,
-                        result: &JBResult::Object(&entity.1),
-                    })
+                room.entities.insert("bc:room".to_owned(), entity);
+                client
+                    .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                        result: JBResultAction::SetRoomBlob {},
+                        success: true,
+                    }]))
                     .await
-                    .wrap_err("Failed to send customer blob to ecast client")?;
+                    .wrap_err("Failed to send result of SetRoomBlob")?;
             }
-            room.entities.insert(key, entity);
-        }
-        "LockRoom" => {
-            client
-                .send_blobcast(JBMessage {
-                    name: Cow::Borrowed("msg"),
-                    args: JBMessageArgs::Array([JBArgs {
-                        arg_type: Cow::Borrowed("Result"),
-                        action: Cow::Borrowed("LockRoom"),
-                        success: Some(true),
-                        room_id: Cow::Borrowed(&room.room_config.code),
-                        ..Default::default()
-                    }]),
-                })
-                .await
-                .wrap_err("Failed to send result of LockRoom to blobcast host")?;
-        }
-        a => bail!("Unimplemented blobcast action {:?}", a),
+            JBAction::SetCustomerBlob {
+                blob,
+                customer_user_id,
+                room_id,
+            } => {
+                let key = format!("bc:customer:{}", customer_user_id);
+                let connection = room
+                    .connections
+                    .iter()
+                    .find(|c| c.profile.user_id == customer_user_id);
+                let entity = {
+                    let prev_value = room.entities.get(&key);
+                    JBEntity(
+                        JBType::Object,
+                        JBObject {
+                            key: key.clone(),
+                            val: JBValue::Object { val: blob },
+                            restrictions: JBRestrictions::default(),
+                            version: prev_value
+                                .as_ref()
+                                .map(|p| p.value().1.version + 1)
+                                .unwrap_or_default(),
+                            from: client.profile.id.into(),
+                        },
+                        JBAttributes {
+                            locked: false.into(),
+                            acl: vec![Acl {
+                                interest: Interest::READABLE,
+                                principle: crate::acl::Principle::Id(
+                                    connection.as_ref().map(|c| *c.key()).unwrap_or_default(),
+                                ),
+                            }],
+                        },
+                    )
+                };
+                if let Some(connection) = connection {
+                    connection
+                        .send_ecast(crate::ecast::ws::JBMessage {
+                            pc: 0,
+                            re: None,
+                            result: &JBResult::Object(&entity.1),
+                        })
+                        .await
+                        .wrap_err("Failed to send customer blob to ecast client")?;
+                }
+                room.entities.insert(key, entity);
+            }
+            JBAction::LockRoom { room_id } => {
+                room.room_config
+                    .locked
+                    .store(true, std::sync::atomic::Ordering::Release);
+                client
+                    .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                        result: JBResultAction::LockRoom {
+                            room_id: Cow::Borrowed(&room.room_config.code),
+                        },
+                        success: true,
+                    }]))
+                    .await
+                    .wrap_err("Failed to send result of LockRoom to blobcast host")?;
+            }
+            JBAction::CreateRoom { .. } => {
+                bail!("Got CreateRoom message, but room is already created")
+            }
+            JBAction::StartSession {
+                module,
+                name,
+                room_id,
+            } => match module {
+                JBSessionModuleWithArgs::Audience(_) => {
+                    let audience = room.entities.get("audience");
+                    client
+                        .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                            result: JBResultAction::StartSession {
+                                module: JBSessionModuleWithResponse::Audience(
+                                    audience.as_ref().map(|e| &e.1.val).unwrap_or(
+                                        &JBValue::AudiencePnCounter {
+                                            count: AtomicI64::new(0),
+                                        },
+                                    ),
+                                ),
+                                name,
+                            },
+                            success: true,
+                        }]))
+                        .await
+                        .wrap_err("Failed to notify blobcast host of room audience connections")?;
+                }
+                JBSessionModuleWithArgs::Vote(count_group) => {
+                    let entity = {
+                        JBEntity(
+                            JBType::AudienceCountGroup,
+                            JBObject {
+                                key: name.clone().into_owned(),
+                                val: JBValue::AudienceCountGroup(count_group),
+                                restrictions: JBRestrictions::default(),
+                                version: 0,
+                                from: client.profile.id.into(),
+                            },
+                            JBAttributes::default(),
+                        )
+                    };
+                    let value = JBResult::AudienceCountGroup(&entity.1);
+                    for client in room.connections.iter() {
+                        match client.client_type {
+                            ClientType::Ecast => {
+                                client
+                                    .send_ecast(crate::ecast::ws::JBMessage {
+                                        pc: 0,
+                                        re: None,
+                                        result: &value,
+                                    })
+                                    .await
+                                    .wrap_err("Failed to send count group to ecast client")?;
+                            }
+                            ClientType::Blobcast => {}
+                        }
+                    }
+                    let JBValue::AudienceCountGroup(ref cg) = entity.1.val else {
+                        unreachable!()
+                    };
+                    client
+                        .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                            result: JBResultAction::StartSession {
+                                module: JBSessionModuleWithResponse::Vote(&cg.choices),
+                                name: name.clone(),
+                            },
+                            success: true,
+                        }]))
+                        .await
+                        .wrap_err("Failed to send result of StartSession")?;
+                    room.entities.insert(name.into_owned(), entity);
+                }
+            },
+            JBAction::StopSession {
+                module,
+                name,
+                room_id,
+            } => match module {
+                JBSessionModule::Audience => {
+                    let audience = room.entities.remove("audience");
+                    client
+                        .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                            result: JBResultAction::StopSession {
+                                module: JBSessionModuleWithResponse::Audience(
+                                    audience.as_ref().map(|(_, e)| &e.1.val).unwrap_or(
+                                        &JBValue::AudiencePnCounter {
+                                            count: AtomicI64::new(0),
+                                        },
+                                    ),
+                                ),
+                                name,
+                            },
+                            success: true,
+                        }]))
+                        .await
+                        .wrap_err("Failed to notify blobcast host of room audience connections")?;
+                }
+                JBSessionModule::Vote => {
+                    let entity = room.entities.remove(name.as_ref());
+                    if let Some((_, entity)) = entity {
+                        let JBValue::AudienceCountGroup(ref cg) = entity.1.val else {
+                            unreachable!()
+                        };
+                        client
+                            .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                                result: JBResultAction::StopSession {
+                                    module: JBSessionModuleWithResponse::Vote(&cg.choices),
+                                    name: name.clone(),
+                                },
+                                success: true,
+                            }]))
+                            .await
+                            .wrap_err("Failed to send result of StopSession")?;
+                    }
+                }
+            },
+            JBAction::GetSessionStatus {
+                module,
+                name,
+                room_id,
+            } => match module {
+                JBSessionModule::Audience => {
+                    let audience = room.entities.get("audience");
+                    client
+                        .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                            result: JBResultAction::GetSessionStatus {
+                                module: JBSessionModuleWithResponse::Audience(
+                                    audience.as_ref().map(|e| &e.1.val).unwrap_or(
+                                        &JBValue::AudiencePnCounter {
+                                            count: AtomicI64::new(0),
+                                        },
+                                    ),
+                                ),
+                                name,
+                            },
+                            success: true,
+                        }]))
+                        .await
+                        .wrap_err("Failed to notify blobcast host of room audience connections")?;
+                }
+                JBSessionModule::Vote => {
+                    let count_group = room.entities.get(name.as_ref());
+
+                    if let Some(count_group) = count_group {
+                        if let JBValue::AudienceCountGroup(JBCountGroup { ref choices, .. }) =
+                            count_group.value().1.val
+                        {
+                            client
+                                .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                                    result: JBResultAction::GetSessionStatus {
+                                        module: JBSessionModuleWithResponse::Vote(choices),
+                                        name,
+                                    },
+                                    success: true,
+                                }]))
+                                .await
+                                .wrap_err(
+                                    "Failed to notify blobcast host of room audience connections",
+                                )?;
+                        }
+                    }
+                }
+            },
+        },
     }
 
     Ok(())

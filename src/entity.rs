@@ -4,8 +4,8 @@ use std::{
 };
 
 use color_eyre::eyre::{self, ContextCompat};
-use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
+use indexmap::IndexMap;
+use serde::{de::Error, Deserialize, Serialize};
 use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use tokio::io::Interest;
 
@@ -26,6 +26,61 @@ pub struct JBObject {
     pub restrictions: JBRestrictions,
     pub version: u32,
     pub from: AtomicI64,
+}
+
+#[derive(Serialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct JBCountGroup {
+    pub choices: IndexMap<String, AtomicI64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_votes: Option<i64>,
+}
+
+impl<'de> Deserialize<'de> for JBCountGroup {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize, Debug)]
+        struct JBCreateCountGroup {
+            #[serde(default)]
+            #[serde(alias = "choices")]
+            options: Vec<serde_json::Value>,
+            #[serde(rename = "maxVotes")]
+            max_votes: Option<i64>,
+        }
+
+        let count_group_opts = JBCreateCountGroup::deserialize(deserializer)?;
+
+        let mut count_group = JBCountGroup {
+            max_votes: count_group_opts.max_votes,
+            ..Default::default()
+        };
+        for opt in count_group_opts.options {
+            count_group.choices.insert(
+                match opt {
+                    serde_json::Value::Null => format!("null"),
+                    serde_json::Value::Bool(b) => format!("{}", b),
+                    serde_json::Value::Number(n) => format!("{}", n),
+                    serde_json::Value::String(s) => s,
+                    serde_json::Value::Array(_) => {
+                        return Err(D::Error::invalid_value(
+                            serde::de::Unexpected::Seq,
+                            &"A valid count-group choice",
+                        ))
+                    }
+                    serde_json::Value::Object(_) => {
+                        return Err(D::Error::invalid_value(
+                            serde::de::Unexpected::Map,
+                            &"A valid count-group choice",
+                        ))
+                    }
+                },
+                0.into(),
+            );
+        }
+        Ok(count_group)
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -49,9 +104,7 @@ pub enum JBValue {
     AudienceGCounter {
         count: AtomicI64,
     },
-    AudienceCountGroup {
-        choices: DashMap<String, AtomicI64>,
-    },
+    AudienceCountGroup(JBCountGroup),
     None {
         val: Option<()>,
     },

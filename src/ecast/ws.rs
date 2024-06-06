@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     io::{Read, Write},
     process::Stdio,
-    sync::{atomic::AtomicI64, Arc},
+    sync::Arc,
     time::Duration,
 };
 
@@ -14,15 +14,17 @@ use color_eyre::eyre::{self, bail, eyre, Context, OptionExt};
 use dashmap::DashMap;
 use futures_util::{stream::SplitStream, SinkExt, StreamExt, TryStreamExt};
 use serde::{de::IgnoredAny, ser::SerializeMap, Deserialize, Serialize};
-use serde_json::json;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::instrument;
 
 use crate::{
     acl::{Acl, Role},
-    blobcast::ws::{JBArgs, JBMessageArgs},
-    entity::{JBAttributes, JBDoodle, JBEntity, JBLine, JBObject, JBRestrictions, JBType, JBValue},
+    blobcast::ws::{JBCustomerOptions, JBEvent, JBResponseArgs},
+    entity::{
+        JBAttributes, JBCountGroup, JBDoodle, JBEntity, JBLine, JBObject, JBRestrictions, JBType,
+        JBValue,
+    },
     Client, ClientType, ConnectedSocket, Connections, DoodleConfig, JBProfile, JBProfileRoles,
     Room, Token,
 };
@@ -237,32 +239,6 @@ impl Default for CreateValue {
     }
 }
 
-#[derive(Debug, Default)]
-struct JBCountGroup {
-    choices: DashMap<String, AtomicI64>,
-}
-
-impl<'de> Deserialize<'de> for JBCountGroup {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize, Debug)]
-        struct JBCreateCountGroup {
-            #[serde(default)]
-            options: Vec<String>,
-        }
-
-        let count_group_opts = JBCreateCountGroup::deserialize(deserializer)?;
-
-        let count_group = JBCountGroup::default();
-        for opt in count_group_opts.options {
-            count_group.choices.insert(opt, 0.into());
-        }
-        Ok(count_group)
-    }
-}
-
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct JBKeyWithLine {
@@ -383,16 +359,16 @@ pub async fn connect_socket(
                         .val
                     {
                         JBValue::AudiencePnCounter { ref count } => {
-                            count.fetch_add(1, std::sync::atomic::Ordering::AcqRel) * 100
+                            (count.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1) * 100
                         }
                         _ => 100,
                     };
                     JBProfile {
                         id: serial,
                         roles: JBProfileRoles::None,
-                        user_id: String::new(),
+                        user_id: url_query.user_id,
                         role: Role::Audience,
-                        name: String::new(),
+                        name: url_query.name,
                     }
                 }
                 Role::Moderator => bail!("Unimplemented role: {:?}", url_query.role),
@@ -447,28 +423,26 @@ pub async fn handle_socket(
         .await
         .wrap_err("Failed to send ecast client/welcome to client")?;
 
-    {
+    if client.profile.role == Role::Player {
         if let Some(host) = room.connections.get(&1) {
             match host.value().client_type {
                 ClientType::Blobcast if !reconnect => {
                     host.value()
-                        .send_blobcast(crate::blobcast::ws::JBMessage {
-                            name: Cow::Borrowed("msg"),
-                            args: JBMessageArgs::Array([JBArgs {
-                                arg_type: Cow::Borrowed("Event"),
-                                event: Cow::Borrowed("CustomerJoinedRoom"),
+                        .send_blobcast(crate::blobcast::ws::JBResponse::Msg([
+                            JBResponseArgs::Event {
                                 room_id: Cow::Borrowed(&room.room_config.code),
-                                customer_user_id: Cow::Borrowed(&client.profile.user_id),
-                                customer_name: Cow::Borrowed(&client.profile.name),
-                                options: json!({
-                                    "roomcode": "",
-                                    "name": client.profile.name,
-                                    "email": "",
-                                    "phone": ""
-                                }),
-                                ..Default::default()
-                            }]),
-                        })
+                                event: JBEvent::CustomerJoinedRoom {
+                                    customer_user_id: Cow::Borrowed(&client.profile.user_id),
+                                    customer_name: Cow::Borrowed(&client.profile.name),
+                                    options: JBCustomerOptions {
+                                        roomcode: Cow::Borrowed(""),
+                                        name: Cow::Borrowed(&client.profile.name),
+                                        email: Cow::Borrowed(""),
+                                        phone: Cow::Borrowed(""),
+                                    },
+                                },
+                            },
+                        ]))
                         .await
                         .wrap_err("Failed to send blobcast CustomerJoinedRoom to host")?;
                 }
@@ -668,9 +642,9 @@ async fn process_message(
                                 }
                             }
                             JBType::Doodle => JBValue::Doodle { val: params.doodle },
-                            JBType::AudienceCountGroup => JBValue::AudienceCountGroup {
-                                choices: params.count_group.choices,
-                            },
+                            JBType::AudienceCountGroup => {
+                                JBValue::AudienceCountGroup(params.count_group)
+                            }
                         },
                         restrictions: params.restrictions,
                         version: prev_value
@@ -918,17 +892,15 @@ async fn process_message(
                 assert_eq!(con.client_type, ClientType::Blobcast);
                 match con.client_type {
                     ClientType::Blobcast => {
-                        con.send_blobcast(crate::blobcast::ws::JBMessage {
-                            name: Cow::Borrowed("msg"),
-                            args: JBMessageArgs::Array([JBArgs {
-                                arg_type: Cow::Borrowed("Event"),
-                                event: Cow::Borrowed("CustomerMessage"),
+                        con.send_blobcast(crate::blobcast::ws::JBResponse::Msg([
+                            JBResponseArgs::Event {
+                                event: JBEvent::CustomerMessage {
+                                    user_id: Cow::Borrowed(&client.profile.user_id),
+                                    message: params.body,
+                                },
                                 room_id: Cow::Borrowed(&room.room_config.code),
-                                user_id: Cow::Borrowed(&client.profile.user_id),
-                                message: params.body,
-                                ..Default::default()
-                            }]),
-                        })
+                            },
+                        ]))
                         .await
                         .wrap_err("Failed to send blobcast host a CustomerMessage")?;
                     }
@@ -953,7 +925,6 @@ async fn process_message(
                 .wrap_err("Failed to send ecast client the result of client/send opcode")?;
         }
         JBParams::RoomGetAudience(_) => {
-            // Audience is unsupported right now
             client
                 .send_ecast(JBMessage {
                     pc: 0,
@@ -1053,7 +1024,9 @@ async fn process_message(
         }
         JBParams::AudienceCountGroupIncrement(params) => {
             if let Some(entity) = room.entities.get(&params.name) {
-                if let JBValue::AudienceCountGroup { ref choices } = entity.value().1.val {
+                if let JBValue::AudienceCountGroup(JBCountGroup { ref choices, .. }) =
+                    entity.value().1.val
+                {
                     choices
                         .get(&params.vote)
                         .map(|c| c.fetch_add(params.times, std::sync::atomic::Ordering::Relaxed));

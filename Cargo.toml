@@ -48,6 +48,7 @@ ratatui = { version = "0.26.3", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.27.0", features = ["event-stream"] }
 boxcar = "0.2.5"
 qrcode = { version = "0.14.0", default-features = false }
+indexmap = { version = "2.2.6", features = ["serde"] }
 
 [profile.dev.package."*"]
 opt-level = 3

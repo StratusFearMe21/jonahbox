@@ -10,17 +10,16 @@ This project extends on the work of [InvoxiPlayGames](https://github.com/InvoxiP
 
 ### Tested known working games:
 
-* The Jackbox Party Pack 2 (Audience manually disabled)
-* The Jackbox Party Pack 3 (Audience manually disabled)
-* The Jackbox Party Pack 4 (Audience manually disabled)
-* The Jackbox Party Pack 5 (Audience manually disabled)
+* The Jackbox Party Pack 2
+* The Jackbox Party Pack 3
+* The Jackbox Party Pack 4
+* The Jackbox Party Pack 5
     * Mad Verse City (Requires TTS to be set up)
-* The Jackbox Party Pack 6 (Audience manually disabled)
-    * Not tested, but I can't imagine why it wouldn't work
+* The Jackbox Party Pack 6
 * The Jackbox Party Pack 7
 * The Jackbox Party Pack 8
 * The Jackbox Party Pack 9
-* The Jackbox Party Pack 10 (w/ Audience)
+* The Jackbox Party Pack 10
     * FixyText (does not work, and is probably a wontfix)
 * Drawful 2 International
 
@@ -35,6 +34,9 @@ This project extends on the work of [InvoxiPlayGames](https://github.com/InvoxiP
 
 * Room passcodes
 * Audiences (WIP)
+    * All games that are in the Party Pack 10 work with audience
+    * Party Packs 7-9 may work
+    * Party Packs 2-6 probably won't work (yet)
 * Moderation features
 
 ## Usage

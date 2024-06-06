@@ -288,6 +288,7 @@ impl Client {
 
         let json_message = serde_json::to_string(&message)
             .wrap_err_with(|| format!("Failed to serialize ecast message: {:?}", &message))?;
+        tracing::trace!(%json_message, "Ecast Message");
         if let Err(e) = self.send_ws_message(Message::Text(json_message)).await {
             self.disconnect().await;
             return Err(e)
@@ -297,16 +298,14 @@ impl Client {
         Ok(())
     }
 
-    pub async fn send_blobcast(&self, message: blobcast::ws::JBMessage<'_>) -> eyre::Result<()> {
+    pub async fn send_blobcast(&self, message: blobcast::ws::JBResponse<'_>) -> eyre::Result<()> {
         tracing::debug!(?message, "Sending WS Message");
 
+        let message = serde_json::to_string(&message)
+            .wrap_err_with(|| format!("Failed to serialize blobcast message: {:?}", &message))?;
+        tracing::trace!(%message, "Blobcast Message");
         if let Err(e) = self
-            .send_ws_message(Message::Text(format!(
-                "5:::{}",
-                serde_json::to_string(&message).wrap_err_with(|| {
-                    format!("Failed to serialize blobcast message: {:?}", &message)
-                })?
-            )))
+            .send_ws_message(Message::Text(format!("5:::{}", message)))
             .await
         {
             self.disconnect().await;

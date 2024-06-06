@@ -87,7 +87,7 @@ pub async fn play_handler(
         ws
             .on_upgrade(move |socket| async move {
                 match ws::connect_socket(socket, Arc::clone(&room_map), state.config.accessible_host.clone()).await.wrap_err("Failed to connect blobcast socket") {
-                    Err(e) => {
+                     Err(e) => {
                         tracing::error!(%e);
                         return;
                     }

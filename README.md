@@ -36,14 +36,14 @@ This project extends on the work of [InvoxiPlayGames](https://github.com/InvoxiP
 * Audiences (WIP)
     * ATM, audience seems to work for all games, though I haven't tested audience with *every* game yet.
     - [x] Party Pack 10
-    - [] Party Pack 9
-    - [] Party Pack 8
-    - [] Party Pack 7
-    - [] Party Pack 6
-    - [] Party Pack 5
-    - [] Party Pack 4
-    - [] Party Pack 3
-    - [] Party Pack 2
+    - [ ] Party Pack 9
+    - [ ] Party Pack 8
+    - [ ] Party Pack 7
+    - [ ] Party Pack 6
+    - [ ] Party Pack 5
+    - [ ] Party Pack 4
+    - [ ] Party Pack 3
+    - [ ] Party Pack 2
 * Moderation features
 
 ## Usage

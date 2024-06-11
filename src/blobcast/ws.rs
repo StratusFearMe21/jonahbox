@@ -10,7 +10,10 @@ use std::{
 use crate::{
     acl::{Acl, Role},
     ecast::ws::JBResult,
-    entity::{JBAttributes, JBCountGroup, JBEntity, JBObject, JBRestrictions, JBType, JBValue},
+    entity::{
+        JBAttributes, JBAudienceValue, JBCountGroup, JBEntity, JBObject, JBPlayerValue,
+        JBRestrictions, JBType, JBValue,
+    },
     Client, ClientType, ConnectedSocket, JBProfile, Room, Token,
 };
 
@@ -410,17 +413,20 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
             JBAction::SetRoomBlob { blob, room_id } => {
                 let entity = {
                     let prev_value = room.entities.get("bc:room");
+                    let version = match prev_value.as_ref().map(|p| &p.value().1.val) {
+                        Some(JBValue::Player { version, .. }) => version + 1,
+                        _ => 0,
+                    };
                     JBEntity(
                         JBType::Object,
                         JBObject {
                             key: "bc:room".to_owned(),
-                            val: JBValue::Object { val: blob },
-                            restrictions: JBRestrictions::default(),
-                            version: prev_value
-                                .as_ref()
-                                .map(|p| p.value().1.version + 1)
-                                .unwrap_or_default(),
-                            from: client.profile.id.into(),
+                            val: JBValue::Player {
+                                val: JBPlayerValue::Object { val: blob },
+                                version,
+                                from: client.profile.id.into(),
+                                restrictions: JBRestrictions::default(),
+                            },
                         },
                         JBAttributes::default(),
                     )
@@ -480,17 +486,20 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                     .find(|c| c.profile.user_id == customer_user_id);
                 let entity = {
                     let prev_value = room.entities.get(&key);
+                    let version = match prev_value.as_ref().map(|p| &p.value().1.val) {
+                        Some(JBValue::Player { version, .. }) => version + 1,
+                        _ => 0,
+                    };
                     JBEntity(
                         JBType::Object,
                         JBObject {
                             key: key.clone(),
-                            val: JBValue::Object { val: blob },
-                            restrictions: JBRestrictions::default(),
-                            version: prev_value
-                                .as_ref()
-                                .map(|p| p.value().1.version + 1)
-                                .unwrap_or_default(),
-                            from: client.profile.id.into(),
+                            val: JBValue::Player {
+                                val: JBPlayerValue::Object { val: blob },
+                                version,
+                                from: client.profile.id.into(),
+                                restrictions: JBRestrictions::default(),
+                            },
                         },
                         JBAttributes {
                             locked: false.into(),
@@ -544,9 +553,9 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                             result: JBResultAction::StartSession {
                                 module: JBSessionModuleWithResponse::Audience(
                                     audience.as_ref().map(|e| &e.1.val).unwrap_or(
-                                        &JBValue::AudiencePnCounter {
+                                        &JBValue::Audience(JBAudienceValue::AudiencePnCounter {
                                             count: AtomicI64::new(0),
-                                        },
+                                        }),
                                     ),
                                 ),
                                 name,
@@ -562,10 +571,9 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                             JBType::AudienceCountGroup,
                             JBObject {
                                 key: name.clone().into_owned(),
-                                val: JBValue::AudienceCountGroup(count_group),
-                                restrictions: JBRestrictions::default(),
-                                version: 0,
-                                from: client.profile.id.into(),
+                                val: JBValue::Audience(JBAudienceValue::AudienceCountGroup(
+                                    count_group,
+                                )),
                             },
                             JBAttributes::default(),
                         )
@@ -586,7 +594,9 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                             ClientType::Blobcast => {}
                         }
                     }
-                    let JBValue::AudienceCountGroup(ref cg) = entity.1.val else {
+                    let JBValue::Audience(JBAudienceValue::AudienceCountGroup(ref cg)) =
+                        entity.1.val
+                    else {
                         unreachable!()
                     };
                     client
@@ -614,9 +624,9 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                             result: JBResultAction::StopSession {
                                 module: JBSessionModuleWithResponse::Audience(
                                     audience.as_ref().map(|(_, e)| &e.1.val).unwrap_or(
-                                        &JBValue::AudiencePnCounter {
+                                        &JBValue::Audience(JBAudienceValue::AudiencePnCounter {
                                             count: AtomicI64::new(0),
-                                        },
+                                        }),
                                     ),
                                 ),
                                 name,
@@ -629,7 +639,9 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                 JBSessionModule::Vote => {
                     let entity = room.entities.remove(name.as_ref());
                     if let Some((_, entity)) = entity {
-                        let JBValue::AudienceCountGroup(ref cg) = entity.1.val else {
+                        let JBValue::Audience(JBAudienceValue::AudienceCountGroup(ref cg)) =
+                            entity.1.val
+                        else {
                             unreachable!()
                         };
                         client
@@ -657,9 +669,9 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                             result: JBResultAction::GetSessionStatus {
                                 module: JBSessionModuleWithResponse::Audience(
                                     audience.as_ref().map(|e| &e.1.val).unwrap_or(
-                                        &JBValue::AudiencePnCounter {
+                                        &JBValue::Audience(JBAudienceValue::AudiencePnCounter {
                                             count: AtomicI64::new(0),
-                                        },
+                                        }),
                                     ),
                                 ),
                                 name,
@@ -673,8 +685,9 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                     let count_group = room.entities.get(name.as_ref());
 
                     if let Some(count_group) = count_group {
-                        if let JBValue::AudienceCountGroup(JBCountGroup { ref choices, .. }) =
-                            count_group.value().1.val
+                        if let JBValue::Audience(JBAudienceValue::AudienceCountGroup(
+                            JBCountGroup { ref choices, .. },
+                        )) = count_group.value().1.val
                         {
                             client
                                 .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {

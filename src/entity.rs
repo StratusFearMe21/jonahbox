@@ -23,9 +23,6 @@ pub struct JBObject {
     #[serde(flatten)]
     #[serde(default)]
     pub val: JBValue,
-    pub restrictions: JBRestrictions,
-    pub version: u32,
-    pub from: AtomicI64,
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -86,6 +83,20 @@ impl<'de> Deserialize<'de> for JBCountGroup {
 #[derive(Serialize, Debug)]
 #[serde(untagged)]
 pub enum JBValue {
+    Player {
+        #[serde(flatten)]
+        val: JBPlayerValue,
+        version: u32,
+        from: AtomicI64,
+        #[serde(skip_serializing_if = "JBRestrictions::is_default")]
+        restrictions: JBRestrictions,
+    },
+    Audience(JBAudienceValue),
+}
+
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+pub enum JBPlayerValue {
     Text {
         val: String,
     },
@@ -98,19 +109,27 @@ pub enum JBValue {
     Doodle {
         val: JBDoodle,
     },
-    AudiencePnCounter {
-        count: AtomicI64,
-    },
-    AudienceGCounter {
-        count: AtomicI64,
-    },
-    AudienceCountGroup(JBCountGroup),
     None {
         val: Option<()>,
     },
 }
 
-impl Default for JBValue {
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+pub enum JBAudienceValue {
+    AudiencePnCounter { count: AtomicI64 },
+    AudienceGCounter { count: AtomicI64 },
+    AudienceCountGroup(JBCountGroup),
+    None { val: Option<()> },
+}
+
+impl Default for JBPlayerValue {
+    fn default() -> Self {
+        Self::None { val: None }
+    }
+}
+
+impl Default for JBAudienceValue {
     fn default() -> Self {
         Self::None { val: None }
     }
@@ -159,7 +178,7 @@ impl FromStr for JBType {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug, Default, PartialEq)]
 pub struct JBRestrictions {
     #[serde(default)]
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -171,6 +190,12 @@ pub struct JBRestrictions {
     pub max: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub increment: Option<f64>,
+}
+
+impl JBRestrictions {
+    fn is_default(&self) -> bool {
+        JBRestrictions::default().eq(self)
+    }
 }
 
 #[derive(Serialize, Debug)]

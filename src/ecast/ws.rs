@@ -22,8 +22,8 @@ use crate::{
     acl::{Acl, Role},
     blobcast::ws::{JBCustomerOptions, JBEvent, JBResponseArgs},
     entity::{
-        JBAttributes, JBCountGroup, JBDoodle, JBEntity, JBLine, JBObject, JBRestrictions, JBType,
-        JBValue,
+        JBAttributes, JBAudienceValue, JBCountGroup, JBDoodle, JBEntity, JBLine, JBObject,
+        JBPlayerValue, JBRestrictions, JBType, JBValue,
     },
     Client, ClientType, ConnectedSocket, Connections, DoodleConfig, JBProfile, JBProfileRoles,
     Room, Token,
@@ -281,8 +281,8 @@ pub struct ClientWelcome<'a> {
     reconnect: bool,
     device_id: Cow<'static, str>,
     entities: GetEntities<'a>,
-    here: GetHere<'a>,
-    profile: &'a JBProfile,
+    here: Option<GetHere<'a>>,
+    profile: Option<&'a JBProfile>,
 }
 
 #[derive(Serialize, Debug)]
@@ -346,10 +346,9 @@ pub async fn connect_socket(
                                 JBType::AudiencePnCounter,
                                 JBObject {
                                     key: "audience".to_owned(),
-                                    val: JBValue::AudiencePnCounter { count: 0.into() },
-                                    restrictions: JBRestrictions::default(),
-                                    version: 0,
-                                    from: 0.into(),
+                                    val: JBValue::Audience(JBAudienceValue::AudiencePnCounter {
+                                        count: 0.into(),
+                                    }),
                                 },
                                 JBAttributes::default(),
                             )
@@ -358,7 +357,7 @@ pub async fn connect_socket(
                         .1
                         .val
                     {
-                        JBValue::AudiencePnCounter { ref count } => {
+                        JBValue::Audience(JBAudienceValue::AudiencePnCounter { ref count }) => {
                             (count.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1) * 100
                         }
                         _ => 100,
@@ -416,8 +415,16 @@ pub async fn handle_socket(
                     role: client.profile.role,
                     id: client.profile.id,
                 },
-                here: GetHere(&room.connections, client.profile.id),
-                profile: &client.profile,
+                here: if client.profile.role == Role::Audience {
+                    None
+                } else {
+                    Some(GetHere(&room.connections, client.profile.id))
+                },
+                profile: if client.profile.role == Role::Audience {
+                    None
+                } else {
+                    Some(&client.profile)
+                },
             }),
         })
         .await
@@ -528,10 +535,7 @@ async fn process_message(
         | JBParams::ObjectUpdate(params)
         | JBParams::DoodleCreate(params)
         | JBParams::DoodleSet(params)
-        | JBParams::DoodleUpdate(params)
-        | JBParams::AudienceGCounterCreate(params)
-        | JBParams::AudiencePnCounterCreate(params)
-        | JBParams::AudienceCountGroupCreate(params) => {
+        | JBParams::DoodleUpdate(params) => {
             let jb_type = jb_type.unwrap();
             let entity = {
                 let prev_value = room.entities.get(&params.key);
@@ -551,7 +555,139 @@ async fn process_message(
                 if !(has_been_created || is_unlocked || has_perms)
                     && client.profile.role != Role::Host
                 {
-                    tracing::error!(acl = ?prev_value.as_ref().map(|pv| pv.value().2.acl.as_slice()), has_been_created, is_unlocked, has_perms, "Returned to sender");
+                    tracing::error!(acl = ?prev_value.as_ref().map(|pv| pv.value().2.acl.as_slice()), has_been_created, is_unlocked, has_perms, "Returned Player type to sender");
+                    client
+                        .send_ecast(JBMessage {
+                            pc: 0,
+                            re: None,
+                            result: &JBResult::Error("Permission denied"),
+                        })
+                        .await
+                        .wrap_err("Failed to send ecast error to client")?;
+
+                    return Ok(());
+                }
+                let version = match prev_value.as_ref().map(|p| &p.value().1.val) {
+                    Some(JBValue::Player { version, .. }) => version + 1,
+                    _ => 0,
+                };
+                JBEntity(
+                    jb_type,
+                    JBObject {
+                        key: params.key.clone(),
+                        val: JBValue::Player {
+                            val: match jb_type {
+                                JBType::Text => {
+                                    match params.val.unwrap_or_else(|| CreateValue::default()) {
+                                        CreateValue::Val(serde_json::Value::String(s)) => {
+                                            JBPlayerValue::Text { val: s }
+                                        }
+                                        CreateValue::Val(serde_json::Value::Null) => {
+                                            JBPlayerValue::None { val: None }
+                                        }
+                                        val => {
+                                            bail!("create/set/get message had invalid text type: {:?}", val)
+                                        }
+                                    }
+                                }
+                                JBType::Number => {
+                                    match params.val.unwrap_or_else(|| CreateValue::default()) {
+                                        CreateValue::Val(serde_json::Value::Number(n)) => {
+                                            JBPlayerValue::Number {
+                                                val: n.as_f64().unwrap(),
+                                            }
+                                        }
+                                        CreateValue::Val(serde_json::Value::Null) => {
+                                            JBPlayerValue::None { val: None }
+                                        }
+                                        val => {
+                                            bail!(
+                                                "create/set/get message had invalid number type: {:?}",
+                                                val
+                                            )
+                                        }
+                                    }
+                                }
+                                JBType::Object => {
+                                    match params.val.unwrap_or_else(|| CreateValue::default()) {
+                                        CreateValue::Val(serde_json::Value::Object(o)) => {
+                                            JBPlayerValue::Object { val: o }
+                                        }
+                                        CreateValue::Val(serde_json::Value::Null) => {
+                                            JBPlayerValue::None { val: None }
+                                        }
+                                        val => {
+                                            bail!(
+                                                "create/set/get message had invalid object type: {:?}",
+                                                val
+                                            )
+                                        }
+                                    }
+                                }
+                                JBType::Doodle => JBPlayerValue::Doodle { val: params.doodle },
+                                _ => bail!("Cannot store Audience type in Player entity"),
+                            },
+                            version,
+                            from: client.profile.id.into(),
+                            restrictions: params.restrictions,
+                        },
+                    },
+                    JBAttributes {
+                        locked: false.into(),
+                        acl: prev_value
+                            .map(|pv| pv.value().2.acl.clone())
+                            .unwrap_or(params.acl),
+                    },
+                )
+            };
+            let value = match jb_type {
+                JBType::Text => JBResult::Text(&entity.1),
+                JBType::Number => JBResult::Number(&entity.1),
+                JBType::Object => JBResult::Object(&entity.1),
+                JBType::Doodle => JBResult::Doodle(&entity.1),
+                _ => bail!("Cannot store Audience type in Player entity"),
+            };
+            for client in room
+                .connections
+                .iter()
+                .filter(|c| c.profile.id != client.profile.id)
+                .filter(|c| {
+                    entity
+                        .2
+                        .perms(c.profile.role, c.profile.id)
+                        .is_some_and(|pv| pv.is_readable())
+                })
+            {
+                let message = JBMessage {
+                    pc: 0,
+                    re: None,
+                    result: &value,
+                };
+                client
+                    .send_ecast(message)
+                    .await
+                    .wrap_err("Failed to send ecast client an entity")?;
+            }
+            room.entities.insert(params.key, entity);
+            client
+                .send_ecast(JBMessage {
+                    pc: 0,
+                    re: Some(message.seq),
+                    result: &JBResult::Ok {},
+                })
+                .await
+                .wrap_err(
+                    "Failed to send the result of create/set/update opcode to ecast client",
+                )?;
+        }
+        JBParams::AudienceGCounterCreate(params)
+        | JBParams::AudiencePnCounterCreate(params)
+        | JBParams::AudienceCountGroupCreate(params) => {
+            let jb_type = jb_type.unwrap();
+            let entity = {
+                let prev_value = room.entities.get(&params.key);
+                if client.profile.role != Role::Host {
+                    tracing::error!(acl = ?prev_value.as_ref().map(|pv| pv.value().2.acl.as_slice()),  "Returned Audience type to sender");
                     client
                         .send_ecast(JBMessage {
                             pc: 0,
@@ -567,58 +703,11 @@ async fn process_message(
                     jb_type,
                     JBObject {
                         key: params.key.clone(),
-                        val: match jb_type {
-                            JBType::Text => match params
-                                .val
-                                .unwrap_or_else(|| CreateValue::default())
-                            {
-                                CreateValue::Val(serde_json::Value::String(s)) => {
-                                    JBValue::Text { val: s }
-                                }
-                                CreateValue::Val(serde_json::Value::Null) => {
-                                    JBValue::None { val: None }
-                                }
-                                val => {
-                                    bail!("create/set/get message had invalid text type: {:?}", val)
-                                }
-                            },
-                            JBType::Number => match params
-                                .val
-                                .unwrap_or_else(|| CreateValue::default())
-                            {
-                                CreateValue::Val(serde_json::Value::Number(n)) => JBValue::Number {
-                                    val: n.as_f64().unwrap(),
-                                },
-                                CreateValue::Val(serde_json::Value::Null) => {
-                                    JBValue::None { val: None }
-                                }
-                                val => {
-                                    bail!(
-                                        "create/set/get message had invalid number type: {:?}",
-                                        val
-                                    )
-                                }
-                            },
-                            JBType::Object => {
-                                match params.val.unwrap_or_else(|| CreateValue::default()) {
-                                    CreateValue::Val(serde_json::Value::Object(o)) => {
-                                        JBValue::Object { val: o }
-                                    }
-                                    CreateValue::Val(serde_json::Value::Null) => {
-                                        JBValue::None { val: None }
-                                    }
-                                    val => {
-                                        bail!(
-                                            "create/set/get message had invalid object type: {:?}",
-                                            val
-                                        )
-                                    }
-                                }
-                            }
+                        val: JBValue::Audience(match jb_type {
                             JBType::AudienceGCounter => {
                                 match params.val.unwrap_or_else(|| CreateValue::default()) {
                                     CreateValue::Count(c) => {
-                                        JBValue::AudienceGCounter { count: c.into() }
+                                        JBAudienceValue::AudienceGCounter { count: c.into() }
                                     }
                                     val => {
                                         bail!(
@@ -631,7 +720,7 @@ async fn process_message(
                             JBType::AudiencePnCounter => {
                                 match params.val.unwrap_or_else(|| CreateValue::default()) {
                                     CreateValue::Count(c) => {
-                                        JBValue::AudiencePnCounter { count: c.into() }
+                                        JBAudienceValue::AudiencePnCounter { count: c.into() }
                                     }
                                     val => {
                                         bail!(
@@ -641,17 +730,11 @@ async fn process_message(
                                     }
                                 }
                             }
-                            JBType::Doodle => JBValue::Doodle { val: params.doodle },
                             JBType::AudienceCountGroup => {
-                                JBValue::AudienceCountGroup(params.count_group)
+                                JBAudienceValue::AudienceCountGroup(params.count_group)
                             }
-                        },
-                        restrictions: params.restrictions,
-                        version: prev_value
-                            .as_ref()
-                            .map(|p| p.value().1.version + 1)
-                            .unwrap_or_default(),
-                        from: client.profile.id.into(),
+                            _ => bail!("Cannot store Player type in Audience entity"),
+                        }),
                     },
                     JBAttributes {
                         locked: false.into(),
@@ -662,13 +745,10 @@ async fn process_message(
                 )
             };
             let value = match jb_type {
-                JBType::Text => JBResult::Text(&entity.1),
-                JBType::Number => JBResult::Number(&entity.1),
-                JBType::Object => JBResult::Object(&entity.1),
-                JBType::Doodle => JBResult::Doodle(&entity.1),
                 JBType::AudiencePnCounter => JBResult::AudiencePnCounter(&entity.1),
                 JBType::AudienceGCounter => JBResult::AudienceGCounter(&entity.1),
                 JBType::AudienceCountGroup => JBResult::AudienceCountGroup(&entity.1),
+                _ => bail!("Cannot store Player type in Audience entity"),
             };
             for client in room
                 .connections
@@ -733,8 +813,12 @@ async fn process_message(
                             .wrap_err("Failed to send doodle/line to ecast client")?;
                     }
                 }
-                if let JBValue::Doodle {
-                    val: ref mut doodle,
+                if let JBValue::Player {
+                    val:
+                        JBPlayerValue::Doodle {
+                            val: ref mut doodle,
+                        },
+                    ..
                 } = entity.value_mut().1.val
                 {
                     doodle.lines.push(params.line);
@@ -783,16 +867,16 @@ async fn process_message(
                     .is_some_and(|i| i.is_writable())
             }) {
                 if let Some(mut entity) = room.entities.get_mut(&params.key) {
-                    entity.value_mut().1.version += 1;
-                    entity
-                        .value()
-                        .1
-                        .from
-                        .store(client.profile.id, std::sync::atomic::Ordering::Release);
-                    let increment = entity.1.restrictions.increment.unwrap_or(1.0);
-
                     match entity.value_mut().1.val {
-                        JBValue::Number { ref mut val } => {
+                        JBValue::Player {
+                            val: JBPlayerValue::Number { ref mut val },
+                            ref mut version,
+                            ref from,
+                            ref restrictions,
+                        } => {
+                            let increment = restrictions.increment.unwrap_or(1.0);
+                            *version += 1;
+                            from.store(client.profile.id, std::sync::atomic::Ordering::Release);
                             *val += increment;
                             for client in room
                                 .connections
@@ -837,16 +921,16 @@ async fn process_message(
                     .is_some_and(|i| i.is_writable())
             }) {
                 if let Some(mut entity) = room.entities.get_mut(&params.key) {
-                    entity.value_mut().1.version += 1;
-                    entity
-                        .value()
-                        .1
-                        .from
-                        .store(client.profile.id, std::sync::atomic::Ordering::Release);
-                    let increment = entity.1.restrictions.increment.unwrap_or(1.0);
-
                     match entity.value_mut().1.val {
-                        JBValue::Number { ref mut val } => {
+                        JBValue::Player {
+                            val: JBPlayerValue::Number { ref mut val },
+                            ref mut version,
+                            ref from,
+                            ref restrictions,
+                        } => {
+                            let increment = restrictions.increment.unwrap_or(1.0);
+                            *version += 1;
+                            from.store(client.profile.id, std::sync::atomic::Ordering::Release);
                             *val -= increment;
                             for client in room
                                 .connections
@@ -881,7 +965,7 @@ async fn process_message(
                     })
                     .await
                     .wrap_err(
-                        "Failed to send ecast client the result of number/decrement opcode",
+                        "Failed to send ecast client the result of number/increment opcode",
                     )?;
             }
         }
@@ -934,7 +1018,9 @@ async fn process_message(
                             .entities
                             .get("audience")
                             .and_then(|e| {
-                                let JBValue::AudiencePnCounter { ref count } = e.value().1.val
+                                let JBValue::Audience(JBAudienceValue::AudiencePnCounter {
+                                    ref count,
+                                }) = e.value().1.val
                                 else {
                                     return None;
                                 };
@@ -982,8 +1068,10 @@ async fn process_message(
         | JBParams::AudiencePnCounterIncrement(params) => {
             if let Some(entity) = room.entities.get(&params.key) {
                 match entity.value().1.val {
-                    JBValue::AudienceGCounter { ref count }
-                    | JBValue::AudiencePnCounter { ref count } => {
+                    JBValue::Audience(
+                        JBAudienceValue::AudienceGCounter { ref count }
+                        | JBAudienceValue::AudiencePnCounter { ref count },
+                    ) => {
                         count.fetch_add(params.times, std::sync::atomic::Ordering::AcqRel);
                     }
                     _ => {}
@@ -1004,8 +1092,10 @@ async fn process_message(
         | JBParams::AudiencePnCounterDecrement(params) => {
             if let Some(entity) = room.entities.get(&params.key) {
                 match entity.value().1.val {
-                    JBValue::AudienceGCounter { ref count }
-                    | JBValue::AudiencePnCounter { ref count } => {
+                    JBValue::Audience(
+                        JBAudienceValue::AudienceGCounter { ref count }
+                        | JBAudienceValue::AudiencePnCounter { ref count },
+                    ) => {
                         count.fetch_sub(params.times, std::sync::atomic::Ordering::AcqRel);
                     }
                     _ => {}
@@ -1024,8 +1114,10 @@ async fn process_message(
         }
         JBParams::AudienceCountGroupIncrement(params) => {
             if let Some(entity) = room.entities.get(&params.name) {
-                if let JBValue::AudienceCountGroup(JBCountGroup { ref choices, .. }) =
-                    entity.value().1.val
+                if let JBValue::Audience(JBAudienceValue::AudienceCountGroup(JBCountGroup {
+                    ref choices,
+                    ..
+                })) = entity.value().1.val
                 {
                     choices
                         .get(&params.vote)
@@ -1062,63 +1154,65 @@ async fn process_message(
         }
         JBParams::Lock(params) => {
             if let Some(entity) = room.entities.get(&params.key) {
-                entity
-                    .value()
-                    .2
-                    .locked
-                    .store(true, std::sync::atomic::Ordering::Release);
-                entity
-                    .value()
-                    .1
-                    .from
-                    .store(client.profile.id, std::sync::atomic::Ordering::Release);
-                let value = JBResult::Lock {
-                    key: Cow::Borrowed(&params.key),
-                    from: client.profile.id,
-                };
-                for client in room
-                    .connections
-                    .iter()
-                    .filter(|c| c.profile.id != client.profile.id)
-                    .filter(|c| {
-                        entity
-                            .2
-                            .perms(c.profile.role, c.profile.id)
-                            .is_some_and(|pv| pv.is_readable())
-                    })
-                {
-                    client
-                        .send_ecast(JBMessage {
-                            pc: 0,
-                            re: None,
-                            result: &value,
+                if let JBValue::Player { ref from, .. } = entity.value().1.val {
+                    entity
+                        .value()
+                        .2
+                        .locked
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    from.store(client.profile.id, std::sync::atomic::Ordering::Release);
+                    let value = JBResult::Lock {
+                        key: Cow::Borrowed(&params.key),
+                        from: client.profile.id,
+                    };
+                    for client in room
+                        .connections
+                        .iter()
+                        .filter(|c| c.profile.id != client.profile.id)
+                        .filter(|c| {
+                            entity
+                                .2
+                                .perms(c.profile.role, c.profile.id)
+                                .is_some_and(|pv| pv.is_readable())
                         })
-                        .await
-                        .wrap_err("Failed to notify ecast client of locked entity")?;
-                }
+                    {
+                        client
+                            .send_ecast(JBMessage {
+                                pc: 0,
+                                re: None,
+                                result: &value,
+                            })
+                            .await
+                            .wrap_err("Failed to notify ecast client of locked entity")?;
+                    }
 
-                if doodle_config.render {
-                    if let JBValue::Doodle { val: ref d } = entity.value().1.val {
-                        let png_path = doodle_config.path.join(format!("{}.png", entity.key()));
-                        d.render()
-                            .wrap_err_with(|| {
-                                format!("Failed to render doodle to {}", png_path.display())
-                            })?
-                            .save_png(&png_path)
-                            .wrap_err_with(|| {
-                                format!("Failed to save doodle to {}", png_path.display())
-                            })?;
+                    if doodle_config.render {
+                        if let JBValue::Player {
+                            val: JBPlayerValue::Doodle { val: ref d },
+                            ..
+                        } = entity.value().1.val
+                        {
+                            let png_path = doodle_config.path.join(format!("{}.png", entity.key()));
+                            d.render()
+                                .wrap_err_with(|| {
+                                    format!("Failed to render doodle to {}", png_path.display())
+                                })?
+                                .save_png(&png_path)
+                                .wrap_err_with(|| {
+                                    format!("Failed to save doodle to {}", png_path.display())
+                                })?;
+                        }
                     }
                 }
+                client
+                    .send_ecast(JBMessage {
+                        pc: 0,
+                        re: Some(message.seq),
+                        result: &JBResult::Ok {},
+                    })
+                    .await
+                    .wrap_err("Failed to send ecast client the result of lock opcode")?;
             }
-            client
-                .send_ecast(JBMessage {
-                    pc: 0,
-                    re: Some(message.seq),
-                    result: &JBResult::Ok {},
-                })
-                .await
-                .wrap_err("Failed to send ecast client the result of lock opcode")?;
         }
         JBParams::Drop(params) => {
             if room.entities.get(&params.key).is_some_and(|e| {

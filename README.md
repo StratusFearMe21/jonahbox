@@ -34,9 +34,16 @@ This project extends on the work of [InvoxiPlayGames](https://github.com/InvoxiP
 
 * Room passcodes
 * Audiences (WIP)
-    * All games that are in the Party Pack 10 work with audience
-    * Party Packs 7-9 may work
-    * Party Packs 2-6 probably won't work (yet)
+    * ATM, audience seems to work for all games, though I haven't tested audience with *every* game yet.
+    - [x] Party Pack 10
+    - [] Party Pack 9
+    - [] Party Pack 8
+    - [] Party Pack 7
+    - [] Party Pack 6
+    - [] Party Pack 5
+    - [] Party Pack 4
+    - [] Party Pack 3
+    - [] Party Pack 2
 * Moderation features
 
 ## Usage

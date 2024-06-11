@@ -13,6 +13,7 @@ use axum::extract::{
 use color_eyre::eyre::{self, bail, eyre, Context, OptionExt};
 use dashmap::DashMap;
 use futures_util::{stream::SplitStream, SinkExt, StreamExt, TryStreamExt};
+use ringbuf::{traits::Producer, Prod};
 use serde::{de::IgnoredAny, ser::SerializeMap, Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -61,6 +62,8 @@ pub enum JBResult<'a> {
     AudienceGCounter(&'a JBObject),
     #[serde(rename = "audience/count-group")]
     AudienceCountGroup(&'a JBObject),
+    #[serde(rename = "audience/text-ring")]
+    AudienceTextRing(&'a JBObject),
     #[serde(rename = "doodle/line")]
     DoodleLine {
         key: Cow<'a, str>,
@@ -139,6 +142,12 @@ enum JBParams {
     AudienceCountGroupCreate(JBCreateParams),
     #[serde(rename = "audience/count-group/get")]
     AudienceCountGroupGet(JBKeyParam),
+    #[serde(rename = "audience/text-ring/create")]
+    AudienceTextRingCreate(JBCreateParams),
+    #[serde(rename = "audience/text-ring/get")]
+    AudienceTextRingGet(JBKeyParam),
+    #[serde(rename = "audience/text-ring/push")]
+    AudienceTextRingPush { name: String, text: String },
     #[serde(rename = "audience/count-group/increment")]
     AudienceCountGroupIncrement(JBCountGroupIncrementParams),
     #[serde(rename = "doodle/create")]
@@ -200,6 +209,9 @@ impl JBParams {
             Self::AudienceCountGroupCreate(_) => Some(JBType::AudienceCountGroup),
             Self::AudienceCountGroupGet(_) => Some(JBType::AudienceCountGroup),
             Self::AudienceCountGroupIncrement(_) => Some(JBType::AudienceCountGroup),
+            Self::AudienceTextRingCreate(_) => Some(JBType::AudienceTextRing),
+            Self::AudienceTextRingGet(_) => Some(JBType::AudienceTextRing),
+            Self::AudienceTextRingPush { .. } => Some(JBType::AudienceTextRing),
             Self::ClientSend(_) => None,
             Self::RoomExit(_) => None,
             Self::RoomGetAudience(_) => None,
@@ -640,13 +652,7 @@ async fn process_message(
                     },
                 )
             };
-            let value = match jb_type {
-                JBType::Text => JBResult::Text(&entity.1),
-                JBType::Number => JBResult::Number(&entity.1),
-                JBType::Object => JBResult::Object(&entity.1),
-                JBType::Doodle => JBResult::Doodle(&entity.1),
-                _ => bail!("Cannot store Audience type in Player entity"),
-            };
+            let value = entity.as_result();
             for client in room
                 .connections
                 .iter()
@@ -682,7 +688,8 @@ async fn process_message(
         }
         JBParams::AudienceGCounterCreate(params)
         | JBParams::AudiencePnCounterCreate(params)
-        | JBParams::AudienceCountGroupCreate(params) => {
+        | JBParams::AudienceCountGroupCreate(params)
+        | JBParams::AudienceTextRingCreate(params) => {
             let jb_type = jb_type.unwrap();
             let entity = {
                 let prev_value = room.entities.get(&params.key);
@@ -733,6 +740,9 @@ async fn process_message(
                             JBType::AudienceCountGroup => {
                                 JBAudienceValue::AudienceCountGroup(params.count_group)
                             }
+                            JBType::AudienceTextRing => {
+                                bail!("Text ring creation unimplemented")
+                            }
                             _ => bail!("Cannot store Player type in Audience entity"),
                         }),
                     },
@@ -744,12 +754,7 @@ async fn process_message(
                     },
                 )
             };
-            let value = match jb_type {
-                JBType::AudiencePnCounter => JBResult::AudiencePnCounter(&entity.1),
-                JBType::AudienceGCounter => JBResult::AudienceGCounter(&entity.1),
-                JBType::AudienceCountGroup => JBResult::AudienceCountGroup(&entity.1),
-                _ => bail!("Cannot store Player type in Audience entity"),
-            };
+            let value = entity.as_result();
             for client in room
                 .connections
                 .iter()
@@ -782,6 +787,26 @@ async fn process_message(
                 .wrap_err(
                     "Failed to send the result of create/set/update opcode to ecast client",
                 )?;
+        }
+        JBParams::TextGet(params)
+        | JBParams::NumberGet(params)
+        | JBParams::ObjectGet(params)
+        | JBParams::DoodleGet(params)
+        | JBParams::AudienceGCounterGet(params)
+        | JBParams::AudiencePnCounterGet(params)
+        | JBParams::AudienceCountGroupGet(params)
+        | JBParams::AudienceTextRingGet(params) => {
+            if let Some(entity) = room.entities.get(&params.key) {
+                let message = JBMessage {
+                    pc: 0,
+                    re: Some(message.seq),
+                    result: &entity.as_result(),
+                };
+                client
+                    .send_ecast(message)
+                    .await
+                    .wrap_err("Failed to send ecast client the requested entity")?;
+            }
         }
         JBParams::DoodleStroke(params) => {
             if let Some(mut entity) = room.entities.get_mut(&params.key) {
@@ -834,33 +859,7 @@ async fn process_message(
                     .wrap_err("Failed to send ecast client the result of doodle/stroke opcode")?;
             }
         }
-        JBParams::TextGet(params)
-        | JBParams::NumberGet(params)
-        | JBParams::ObjectGet(params)
-        | JBParams::DoodleGet(params)
-        | JBParams::AudienceGCounterGet(params)
-        | JBParams::AudiencePnCounterGet(params)
-        | JBParams::AudienceCountGroupGet(params) => {
-            if let Some(entity) = room.entities.get(&params.key) {
-                let message = JBMessage {
-                    pc: 0,
-                    re: Some(message.seq),
-                    result: &match jb_type.unwrap() {
-                        JBType::Text => JBResult::Text(&entity.1),
-                        JBType::Number => JBResult::Number(&entity.1),
-                        JBType::Object => JBResult::Object(&entity.1),
-                        JBType::Doodle => JBResult::Doodle(&entity.1),
-                        JBType::AudiencePnCounter => JBResult::AudiencePnCounter(&entity.1),
-                        JBType::AudienceGCounter => JBResult::AudienceGCounter(&entity.1),
-                        JBType::AudienceCountGroup => JBResult::AudienceCountGroup(&entity.1),
-                    },
-                };
-                client
-                    .send_ecast(message)
-                    .await
-                    .wrap_err("Failed to send ecast client the requested entity")?;
-            }
-        }
+
         JBParams::NumberIncrement(params) => {
             if room.entities.get(&params.key).is_some_and(|e| {
                 e.2.perms(client.profile.role, client.profile.id)
@@ -892,7 +891,7 @@ async fn process_message(
                                 let message = JBMessage {
                                     pc: 0,
                                     re: None,
-                                    result: &JBResult::Number(&entity.1),
+                                    result: &entity.as_result(),
                                 };
                                 client
                                     .send_ecast(message)
@@ -946,7 +945,7 @@ async fn process_message(
                                 let message = JBMessage {
                                     pc: 0,
                                     re: None,
-                                    result: &JBResult::Number(&entity.1),
+                                    result: &entity.as_result(),
                                 };
                                 client
                                     .send_ecast(message)
@@ -1133,6 +1132,25 @@ async fn process_message(
                 .await
                 .wrap_err(
                     "Failed to send ecast client the result of audience/g-counter/increment opcode",
+                )?;
+        }
+        JBParams::AudienceTextRingPush { name, text } => {
+            if let Some(entity) = room.entities.get(&name) {
+                if let JBValue::Audience(JBAudienceValue::AudienceTextRing { ref elements }) =
+                    entity.value().1.val
+                {
+                    let _ = Prod::new(elements.clone().buffer).try_push(text);
+                }
+            }
+            client
+                .send_ecast(JBMessage {
+                    pc: 0,
+                    re: Some(message.seq),
+                    result: &JBResult::Ok {},
+                })
+                .await
+                .wrap_err(
+                    "Failed to send ecast client the result of audience/text-ring/push opcode",
                 )?;
         }
         JBParams::RoomExit(_) => {

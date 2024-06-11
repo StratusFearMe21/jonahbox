@@ -9,10 +9,9 @@ use std::{
 
 use crate::{
     acl::{Acl, Role},
-    ecast::ws::JBResult,
     entity::{
-        JBAttributes, JBAudienceValue, JBCountGroup, JBEntity, JBObject, JBPlayerValue,
-        JBRestrictions, JBType, JBValue,
+        AudienceTextRing, JBAttributes, JBAudienceValue, JBCountGroup, JBEntity, JBObject,
+        JBPlayerValue, JBRestrictions, JBType, JBValue,
     },
     Client, ClientType, ConnectedSocket, JBProfile, Room, Token,
 };
@@ -22,6 +21,7 @@ use color_eyre::eyre::{self, bail, eyre, OptionExt, WrapErr};
 use dashmap::DashMap;
 use futures_util::{stream::SplitStream, SinkExt, StreamExt, TryStreamExt};
 use indexmap::IndexMap;
+use ringbuf::HeapRb;
 use serde::{de::IgnoredAny, Deserialize, Serialize};
 use tokio::{
     io::Interest,
@@ -185,6 +185,11 @@ pub enum JBResultAction<'a> {
 pub enum JBSessionModuleWithArgs {
     Audience(IgnoredAny),
     Vote(JBCountGroup),
+    #[serde(rename_all = "camelCase")]
+    Comment {
+        comments_per_poll: usize,
+        max_comments: usize,
+    },
 }
 
 #[derive(Serialize, Debug)]
@@ -193,13 +198,15 @@ pub enum JBSessionModuleWithArgs {
 pub enum JBSessionModuleWithResponse<'a> {
     Audience(&'a JBValue),
     Vote(&'a IndexMap<String, AtomicI64>),
+    Comment { comments: AudienceTextRing },
 }
 
-impl From<JBSessionModuleWithArgs> for JBSessionModule {
-    fn from(value: JBSessionModuleWithArgs) -> Self {
-        match value {
-            JBSessionModuleWithArgs::Audience(_) => Self::Audience,
-            JBSessionModuleWithArgs::Vote(_) => Self::Vote,
+impl JBSessionModuleWithArgs {
+    fn ommit_args(&self) -> JBSessionModule {
+        match self {
+            JBSessionModuleWithArgs::Audience(_) => JBSessionModule::Audience,
+            JBSessionModuleWithArgs::Vote(_) => JBSessionModule::Vote,
+            JBSessionModuleWithArgs::Comment { .. } => JBSessionModule::Comment,
         }
     }
 }
@@ -209,6 +216,17 @@ impl From<JBSessionModuleWithArgs> for JBSessionModule {
 pub enum JBSessionModule {
     Audience,
     Vote,
+    Comment,
+}
+
+impl JBSessionModule {
+    fn entity_type(&self) -> JBType {
+        match self {
+            JBSessionModule::Audience => JBType::AudiencePnCounter,
+            JBSessionModule::Vote => JBType::AudienceCountGroup,
+            JBSessionModule::Comment => JBType::AudienceTextRing,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -431,7 +449,7 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                         JBAttributes::default(),
                     )
                 };
-                let value = JBResult::Object(&entity.1);
+                let value = entity.as_result();
                 for client in room.connections.iter() {
                     match client.client_type {
                         ClientType::Ecast => {
@@ -517,7 +535,7 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                         .send_ecast(crate::ecast::ws::JBMessage {
                             pc: 0,
                             re: None,
-                            result: &JBResult::Object(&entity.1),
+                            result: &entity.as_result(),
                         })
                         .await
                         .wrap_err("Failed to send customer blob to ecast client")?;
@@ -545,73 +563,134 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                 module,
                 name,
                 room_id,
-            } => match module {
-                JBSessionModuleWithArgs::Audience(_) => {
-                    let audience = room.entities.get("audience");
-                    client
-                        .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
-                            result: JBResultAction::StartSession {
-                                module: JBSessionModuleWithResponse::Audience(
-                                    audience.as_ref().map(|e| &e.1.val).unwrap_or(
-                                        &JBValue::Audience(JBAudienceValue::AudiencePnCounter {
-                                            count: AtomicI64::new(0),
-                                        }),
+            } => {
+                let value_type = module.ommit_args().entity_type();
+                match module {
+                    JBSessionModuleWithArgs::Audience(_) => {
+                        let audience = room.entities.get("audience");
+                        client
+                            .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                                result: JBResultAction::StartSession {
+                                    module: JBSessionModuleWithResponse::Audience(
+                                        audience.as_ref().map(|e| &e.1.val).unwrap_or(
+                                            &JBValue::Audience(
+                                                JBAudienceValue::AudiencePnCounter {
+                                                    count: AtomicI64::new(0),
+                                                },
+                                            ),
+                                        ),
                                     ),
-                                ),
-                                name,
-                            },
-                            success: true,
-                        }]))
-                        .await
-                        .wrap_err("Failed to notify blobcast host of room audience connections")?;
-                }
-                JBSessionModuleWithArgs::Vote(count_group) => {
-                    let entity = {
-                        JBEntity(
-                            JBType::AudienceCountGroup,
-                            JBObject {
-                                key: name.clone().into_owned(),
-                                val: JBValue::Audience(JBAudienceValue::AudienceCountGroup(
-                                    count_group,
-                                )),
-                            },
-                            JBAttributes::default(),
-                        )
-                    };
-                    let value = JBResult::AudienceCountGroup(&entity.1);
-                    for client in room.connections.iter() {
-                        match client.client_type {
-                            ClientType::Ecast => {
-                                client
-                                    .send_ecast(crate::ecast::ws::JBMessage {
-                                        pc: 0,
-                                        re: None,
-                                        result: &value,
-                                    })
-                                    .await
-                                    .wrap_err("Failed to send count group to ecast client")?;
-                            }
-                            ClientType::Blobcast => {}
-                        }
+                                    name,
+                                },
+                                success: true,
+                            }]))
+                            .await
+                            .wrap_err(
+                                "Failed to notify blobcast host of room audience connections",
+                            )?;
                     }
-                    let JBValue::Audience(JBAudienceValue::AudienceCountGroup(ref cg)) =
-                        entity.1.val
-                    else {
-                        unreachable!()
-                    };
-                    client
-                        .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
-                            result: JBResultAction::StartSession {
-                                module: JBSessionModuleWithResponse::Vote(&cg.choices),
-                                name: name.clone(),
-                            },
-                            success: true,
-                        }]))
-                        .await
-                        .wrap_err("Failed to send result of StartSession")?;
-                    room.entities.insert(name.into_owned(), entity);
+                    JBSessionModuleWithArgs::Vote(count_group) => {
+                        let entity = {
+                            JBEntity(
+                                value_type,
+                                JBObject {
+                                    key: name.clone().into_owned(),
+                                    val: JBValue::Audience(JBAudienceValue::AudienceCountGroup(
+                                        count_group,
+                                    )),
+                                },
+                                JBAttributes::default(),
+                            )
+                        };
+                        let value = entity.as_result();
+                        for client in room.connections.iter() {
+                            match client.client_type {
+                                ClientType::Ecast => {
+                                    client
+                                        .send_ecast(crate::ecast::ws::JBMessage {
+                                            pc: 0,
+                                            re: None,
+                                            result: &value,
+                                        })
+                                        .await
+                                        .wrap_err("Failed to send count group to ecast client")?;
+                                }
+                                ClientType::Blobcast => {}
+                            }
+                        }
+                        let JBValue::Audience(JBAudienceValue::AudienceCountGroup(ref cg)) =
+                            entity.1.val
+                        else {
+                            unreachable!()
+                        };
+                        client
+                            .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                                result: JBResultAction::StartSession {
+                                    module: JBSessionModuleWithResponse::Vote(&cg.choices),
+                                    name: name.clone(),
+                                },
+                                success: true,
+                            }]))
+                            .await
+                            .wrap_err("Failed to send result of StartSession")?;
+                        room.entities.insert(name.into_owned(), entity);
+                    }
+                    JBSessionModuleWithArgs::Comment {
+                        comments_per_poll,
+                        max_comments,
+                    } => {
+                        let entity = {
+                            JBEntity(
+                                value_type,
+                                JBObject {
+                                    key: name.clone().into_owned(),
+                                    val: JBValue::Audience(JBAudienceValue::AudienceTextRing {
+                                        elements: AudienceTextRing {
+                                            buffer: Arc::new(HeapRb::new(max_comments)),
+                                            comments_per_poll,
+                                        },
+                                    }),
+                                },
+                                JBAttributes::default(),
+                            )
+                        };
+                        let value = entity.as_result();
+                        for client in room.connections.iter() {
+                            match client.client_type {
+                                ClientType::Ecast => {
+                                    client
+                                        .send_ecast(crate::ecast::ws::JBMessage {
+                                            pc: 0,
+                                            re: None,
+                                            result: &value,
+                                        })
+                                        .await
+                                        .wrap_err("Failed to send count group to ecast client")?;
+                                }
+                                ClientType::Blobcast => {}
+                            }
+                        }
+                        let JBValue::Audience(JBAudienceValue::AudienceTextRing { ref elements }) =
+                            entity.1.val
+                        else {
+                            unreachable!()
+                        };
+                        client
+                            .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                                result: JBResultAction::StartSession {
+                                    module: JBSessionModuleWithResponse::Comment {
+                                        comments: elements.clone(),
+                                    },
+                                    name: name.clone(),
+                                },
+                                success: true,
+                            }]))
+                            .await
+                            .wrap_err("Failed to send result of StartSession")?;
+                        room.entities.insert(name.into_owned(), entity);
+                    }
                 }
-            },
+            }
             JBAction::StopSession {
                 module,
                 name,
@@ -648,6 +727,28 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                             .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
                                 result: JBResultAction::StopSession {
                                     module: JBSessionModuleWithResponse::Vote(&cg.choices),
+                                    name: name.clone(),
+                                },
+                                success: true,
+                            }]))
+                            .await
+                            .wrap_err("Failed to send result of StopSession")?;
+                    }
+                }
+                JBSessionModule::Comment => {
+                    let entity = room.entities.remove(name.as_ref());
+                    if let Some((_, entity)) = entity {
+                        let JBValue::Audience(JBAudienceValue::AudienceTextRing { ref elements }) =
+                            entity.1.val
+                        else {
+                            unreachable!()
+                        };
+                        client
+                            .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                                result: JBResultAction::StopSession {
+                                    module: JBSessionModuleWithResponse::Comment {
+                                        comments: elements.clone(),
+                                    },
                                     name: name.clone(),
                                 },
                                 success: true,
@@ -693,6 +794,31 @@ async fn process_message(client: &Client, message: JBMessage<'_>, room: &Room) -
                                 .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
                                     result: JBResultAction::GetSessionStatus {
                                         module: JBSessionModuleWithResponse::Vote(choices),
+                                        name,
+                                    },
+                                    success: true,
+                                }]))
+                                .await
+                                .wrap_err(
+                                    "Failed to notify blobcast host of room audience connections",
+                                )?;
+                        }
+                    }
+                }
+                JBSessionModule::Comment => {
+                    let text_ring = room.entities.get(name.as_ref());
+
+                    if let Some(text_ring) = text_ring {
+                        if let JBValue::Audience(JBAudienceValue::AudienceTextRing {
+                            ref elements,
+                        }) = text_ring.value().1.val
+                        {
+                            client
+                                .send_blobcast(JBResponse::Msg([JBResponseArgs::Result {
+                                    result: JBResultAction::GetSessionStatus {
+                                        module: JBSessionModuleWithResponse::Comment {
+                                            comments: elements.clone(),
+                                        },
                                         name,
                                     },
                                     success: true,

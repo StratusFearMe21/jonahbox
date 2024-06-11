@@ -1,20 +1,40 @@
 use std::{
+    fmt::Debug,
     str::FromStr,
-    sync::atomic::{AtomicBool, AtomicI64},
+    sync::{
+        atomic::{AtomicBool, AtomicI64},
+        Arc,
+    },
 };
 
 use color_eyre::eyre::{self, ContextCompat};
 use indexmap::IndexMap;
-use serde::{de::Error, Deserialize, Serialize};
+use ringbuf::{traits::Consumer, Cons};
+use serde::{de::Error, ser::SerializeSeq, Deserialize, Serialize, Serializer};
 use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use tokio::io::Interest;
 
-use crate::acl::Role;
+use crate::{acl::Role, ecast::ws::JBResult};
 
 use super::acl::Acl;
 
 #[derive(Serialize, Debug)]
 pub struct JBEntity(pub JBType, pub JBObject, pub JBAttributes);
+
+impl JBEntity {
+    pub fn as_result<'a>(&'a self) -> JBResult<'a> {
+        match self.0 {
+            JBType::Text => JBResult::Text(&self.1),
+            JBType::Number => JBResult::Number(&self.1),
+            JBType::Object => JBResult::Object(&self.1),
+            JBType::Doodle => JBResult::Doodle(&self.1),
+            JBType::AudienceGCounter => JBResult::AudienceGCounter(&self.1),
+            JBType::AudiencePnCounter => JBResult::AudiencePnCounter(&self.1),
+            JBType::AudienceCountGroup => JBResult::AudienceCountGroup(&self.1),
+            JBType::AudienceTextRing => JBResult::AudienceTextRing(&self.1),
+        }
+    }
+}
 
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -117,10 +137,51 @@ pub enum JBPlayerValue {
 #[derive(Serialize, Debug)]
 #[serde(untagged)]
 pub enum JBAudienceValue {
-    AudiencePnCounter { count: AtomicI64 },
-    AudienceGCounter { count: AtomicI64 },
+    AudiencePnCounter {
+        count: AtomicI64,
+    },
+    AudienceGCounter {
+        count: AtomicI64,
+    },
     AudienceCountGroup(JBCountGroup),
-    None { val: Option<()> },
+    /// If a value of this type is shown in the TUI, it will prevent values
+    /// from reaching the host. This is a bug that I don't really care too
+    /// much about.
+    AudienceTextRing {
+        elements: AudienceTextRing,
+    },
+    None {
+        val: Option<()>,
+    },
+}
+
+#[derive(Clone)]
+pub struct AudienceTextRing {
+    pub buffer: Arc<ringbuf::HeapRb<String>>,
+    pub comments_per_poll: usize,
+}
+
+impl Debug for AudienceTextRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudienceTextRing").finish_non_exhaustive()
+    }
+}
+
+impl Serialize for AudienceTextRing {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq_ser = serializer.serialize_seq(None)?;
+
+        let mut consumer = Cons::new(Arc::clone(&self.buffer));
+
+        for item in consumer.pop_iter().take(self.comments_per_poll) {
+            seq_ser.serialize_element(&item)?;
+        }
+
+        seq_ser.end()
+    }
 }
 
 impl Default for JBPlayerValue {
@@ -148,6 +209,8 @@ pub enum JBType {
     AudiencePnCounter,
     #[serde(rename = "audience/count-group")]
     AudienceCountGroup,
+    #[serde(rename = "audience/text-ring")]
+    AudienceTextRing,
 }
 
 impl JBType {
@@ -160,6 +223,7 @@ impl JBType {
             Self::AudiencePnCounter => "audience/pn-counter",
             Self::AudienceGCounter => "audience/g-counter",
             Self::AudienceCountGroup => "audience/count-group",
+            Self::AudienceTextRing => "audience/text-ring",
         }
     }
 }

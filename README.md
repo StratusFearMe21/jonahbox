@@ -41,9 +41,9 @@ This project extends on the work of [InvoxiPlayGames](https://github.com/InvoxiP
     - [ ] Party Pack 7
     - [ ] Party Pack 6
     - [ ] Party Pack 5
-    - [ ] Party Pack 4
-    - [ ] Party Pack 3
-    - [ ] Party Pack 2
+    - [x] Party Pack 4
+    - [x] Party Pack 3
+    - [x] Party Pack 2
 * Moderation features
 
 ## Usage

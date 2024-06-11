@@ -1197,6 +1197,7 @@ dependencies = [
  "ratatui",
  "regex-cursor",
  "reqwest",
+ "ringbuf",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -1859,6 +1860,15 @@ dependencies = [
  "spin",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "ringbuf"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c65e4c865bc3d2e3294493dff0acf7e6c259d066e34e22059fa9c39645c3636"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]

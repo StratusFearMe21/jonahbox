@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     fmt::{Debug, Display, LowerHex},
+    io::stdout,
     net::SocketAddr,
     ops::DerefMut,
     path::PathBuf,
@@ -24,6 +25,7 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use color_eyre::eyre::{self, Context};
+use crossterm::tty::IsTty;
 use dashmap::DashMap;
 use error::WithStatusCode;
 use futures_util::{
@@ -448,7 +450,7 @@ async fn main() -> eyre::Result<()> {
                 .unwrap(),
         );
     let tui_state = state.clone();
-    let tui_future = if state.config.tui {
+    let tui_future = if state.config.tui && stdout().is_tty() {
         let log_writer = tui::tracing_writer::TuiWriter::new(tx);
         let fmt_layer = tracing_subscriber::fmt::layer()
             .event_format(log_writer.clone())
@@ -460,13 +462,19 @@ async fn main() -> eyre::Result<()> {
             tui_state,
             Some(log_writer),
             rx,
-            state.config.tui,
+            state.config.tui && stdout().is_tty(),
         )
     } else {
         tracing_registry
             .with(tracing_subscriber::fmt::layer())
             .init();
-        tui::tui(handle.clone(), tui_state, None, rx, state.config.tui)
+        tui::tui(
+            handle.clone(),
+            tui_state,
+            None,
+            rx,
+            state.config.tui && stdout().is_tty(),
+        )
     };
 
     tokio::fs::create_dir_all(&state.config.doodles.path)

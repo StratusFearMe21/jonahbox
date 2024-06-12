@@ -76,7 +76,8 @@ pub async fn play_handler(
             let ecast_req = format!("{}/socket.io/websocket/{}", host, id.0);
             async move {
                 if let Err(e) = ws::handle_socket_proxy(host, socket, ecast_req).await {
-                    tracing::error!(error = %e, "Failed to proxy blobcast host");
+                    let e = crate::error::Error(StatusCode::INTERNAL_SERVER_ERROR, e);
+                    tracing::error!(error = ?e, "Failed to proxy blobcast host");
                 }
             }
         })
@@ -88,13 +89,15 @@ pub async fn play_handler(
             .on_upgrade(move |socket| async move {
                 match ws::connect_socket(socket, Arc::clone(&room_map), state.config.accessible_host.clone()).await.wrap_err("Failed to connect blobcast socket") {
                      Err(e) => {
-                        tracing::error!(%e);
+                        let e = crate::error::Error(StatusCode::INTERNAL_SERVER_ERROR, e);
+                        tracing::error!(?e);
                         return;
                     }
                     Ok(socket) => {
                         sender.send(()).unwrap();
                         if let Err(e) = ws::handle_socket(socket.read_half, Arc::clone(&socket.room), Arc::clone(&socket.client)).await {
-                            tracing::error!(id = socket.client.profile.id, role = ?socket.client.profile.role, error = %e, "Error in WebSocket");
+                            let e = crate::error::Error(StatusCode::INTERNAL_SERVER_ERROR, e);
+                            tracing::error!(id = socket.client.profile.id, role = ?socket.client.profile.role, error = ?e, "Error in WebSocket");
                             socket.client.disconnect().await;
                         } else {
                             tracing::debug!(id = socket.client.profile.id, role = ?socket.client.profile.role, "Leaving room");

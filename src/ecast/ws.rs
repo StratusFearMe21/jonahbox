@@ -10,14 +10,21 @@ use axum::extract::{
     ws::{Message, WebSocket},
     Query,
 };
+use base64::Engine;
 use color_eyre::eyre::{self, bail, eyre, Context, OptionExt};
 use dashmap::DashMap;
 use futures_util::{stream::SplitStream, SinkExt, StreamExt, TryStreamExt};
 use ringbuf::{traits::Producer, Prod};
-use serde::{de::IgnoredAny, ser::SerializeMap, Deserialize, Serialize};
+use serde::{de::Error, de::IgnoredAny, ser::SerializeMap, Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::instrument;
+use yrs::{
+    sync::{Awareness, SyncMessage},
+    types::text::YChange,
+    updates::{decoder::Decode, encoder::Encode},
+    Doc, GetString, ReadTxn, Snapshot, Text, TextPrelim, Transact, Update, WriteTxn,
+};
 
 use crate::{
     acl::{Acl, Role},
@@ -56,6 +63,22 @@ pub enum JBResult<'a> {
     Object(&'a JBObject),
     #[serde(rename = "doodle")]
     Doodle(&'a JBObject),
+    #[serde(rename = "text-map")]
+    TextMap(&'a JBObject),
+    #[serde(rename = "text-map/synced")]
+    TextMapSynced {
+        key: Cow<'a, str>,
+        msg: String,
+        from: i64,
+    },
+    #[serde(rename = "text-map/state")]
+    TextMapState {
+        key: String,
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attributions: Option<Vec<JBTextMapAttribution>>,
+        from: i64,
+    },
     #[serde(rename = "audience/pn-counter")]
     AudiencePnCounter(&'a JBObject),
     #[serde(rename = "audience/g-counter")]
@@ -69,6 +92,12 @@ pub enum JBResult<'a> {
         key: Cow<'a, str>,
         from: i64,
         val: &'a JBLine,
+    },
+    #[serde(rename = "doodle/line/removed")]
+    DoodleLineRemoved {
+        key: Cow<'a, str>,
+        from: i64,
+        index: usize,
     },
     #[serde(rename = "room/get-audience")]
     RoomGetAudience { connections: i64 },
@@ -122,6 +151,16 @@ enum JBParams {
     ObjectUpdate(JBCreateParams),
     #[serde(rename = "object/get")]
     ObjectGet(JBKeyParam),
+    #[serde(rename = "text-map/create")]
+    TextMapCreate(JBCreateParams),
+    #[serde(rename = "text-map/sync")]
+    TextMapSync(JBTextMapSyncParams),
+    #[serde(rename = "text-map/get")]
+    TextMapGet {
+        key: String,
+        #[serde(rename = "includeNodes")]
+        include_nodes: bool,
+    },
     #[serde(rename = "audience/g-counter/create")]
     AudienceGCounterCreate(JBCreateParams),
     #[serde(rename = "audience/g-counter/get")]
@@ -160,6 +199,8 @@ enum JBParams {
     DoodleGet(JBKeyParam),
     #[serde(rename = "doodle/stroke")]
     DoodleStroke(JBKeyWithLine),
+    #[serde(rename = "doodle/undo")]
+    DoodleUndo(JBKeyParam),
     #[serde(rename = "client/send")]
     ClientSend(JBClientSendParams),
     #[serde(rename = "room/exit")]
@@ -198,6 +239,10 @@ impl JBParams {
             Self::DoodleUpdate(_) => Some(JBType::Doodle),
             Self::DoodleGet(_) => Some(JBType::Doodle),
             Self::DoodleStroke(_) => Some(JBType::Doodle),
+            Self::DoodleUndo(_) => Some(JBType::Doodle),
+            Self::TextMapCreate(_) => Some(JBType::TextMap),
+            Self::TextMapGet { .. } => Some(JBType::TextMap),
+            Self::TextMapSync(_) => Some(JBType::TextMap),
             Self::AudienceGCounterCreate(_) => Some(JBType::AudienceGCounter),
             Self::AudienceGCounterGet(_) => Some(JBType::AudienceGCounter),
             Self::AudienceGCounterIncrement(_) => Some(JBType::AudienceGCounter),
@@ -261,6 +306,7 @@ struct JBKeyWithLine {
 
 #[derive(Deserialize, Debug)]
 struct JBKeyParam {
+    #[serde(alias = "name")]
     key: String,
 }
 
@@ -283,6 +329,54 @@ pub struct JBClientSendParams {
     _from: i64,
     to: i64,
     body: serde_json::Value,
+}
+
+#[derive(Serialize, Debug)]
+pub struct JBTextMapAttribution {
+    author: u64,
+    text: Arc<str>,
+    pc: u64,
+}
+
+#[derive(Debug)]
+pub struct JBTextMapSyncParams {
+    key: String,
+    msg: yrs::sync::Message,
+}
+
+impl<'de> Deserialize<'de> for JBTextMapSyncParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct JBTextMapSyncInitParams {
+            key: String,
+            msg: String,
+        }
+
+        let map_init = JBTextMapSyncInitParams::deserialize(deserializer)?;
+
+        Ok(Self {
+            key: map_init.key,
+            msg: yrs::sync::Message::decode_v1(
+                &base64::prelude::BASE64_STANDARD
+                    .decode(&map_init.msg)
+                    .map_err(|_| {
+                        D::Error::invalid_value(
+                            serde::de::Unexpected::Str(&map_init.msg),
+                            &"A valid base64 string",
+                        )
+                    })?,
+            )
+            .map_err(|_| {
+                D::Error::invalid_value(
+                    serde::de::Unexpected::Str(&map_init.msg),
+                    &"A valid yrs Message",
+                )
+            })?,
+        })
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -547,7 +641,8 @@ async fn process_message(
         | JBParams::ObjectUpdate(params)
         | JBParams::DoodleCreate(params)
         | JBParams::DoodleSet(params)
-        | JBParams::DoodleUpdate(params) => {
+        | JBParams::DoodleUpdate(params)
+        | JBParams::TextMapCreate(params) => {
             let jb_type = jb_type.unwrap();
             let entity = {
                 let prev_value = room.entities.get(&params.key);
@@ -633,6 +728,34 @@ async fn process_message(
                                                 "create/set/get message had invalid object type: {:?}",
                                                 val
                                             )
+                                        }
+                                    }
+                                }
+                                JBType::TextMap => {
+                                    match params.val.unwrap_or_else(|| CreateValue::default()) {
+                                        CreateValue::Val(serde_json::Value::String(s)) => {
+                                            let doc = Doc::with_client_id(1);
+                                            {
+                                                let mut txn = doc.transact_mut();
+                                                txn.get_or_insert_text("default").insert_embed(
+                                                    &mut txn,
+                                                    0,
+                                                    TextPrelim::new(""),
+                                                );
+
+                                                txn.get_or_insert_text("ecast")
+                                                    .insert(&mut txn, 0, &s);
+                                            }
+
+                                            JBPlayerValue::TextMap {
+                                                root: Awareness::new(doc),
+                                            }
+                                        }
+                                        CreateValue::Val(serde_json::Value::Null) => {
+                                            JBPlayerValue::None { val: None }
+                                        }
+                                        val => {
+                                            bail!("create/set/get message had invalid text type: {:?}", val)
                                         }
                                     }
                                 }
@@ -808,6 +931,154 @@ async fn process_message(
                     .wrap_err("Failed to send ecast client the requested entity")?;
             }
         }
+        JBParams::TextMapSync(params) => {
+            if let Some(mut entity) = room.entities.get_mut(&params.key) {
+                if let JBValue::Player {
+                    val: JBPlayerValue::TextMap { ref mut root },
+                    ..
+                } = entity.value_mut().1.val
+                {
+                    let result = JBResult::TextMapSynced {
+                        key: Cow::Borrowed(&params.key),
+                        msg: base64::prelude::BASE64_STANDARD.encode(params.msg.encode_v1()),
+                        from: client.profile.id,
+                    };
+
+                    match params.msg {
+                        yrs::sync::Message::Sync(m) => match m {
+                            SyncMessage::Update(u) => root.doc().transact_mut().apply_update(
+                                Update::decode_v1(&u).wrap_err("Failed to decode yjs Update v1")?,
+                            ),
+                            SyncMessage::SyncStep1(sv) => {
+                                let update = root.doc().transact().encode_state_as_update_v1(&sv);
+
+                                let result = JBResult::TextMapSynced {
+                                    key: Cow::Borrowed(&params.key),
+                                    msg: base64::prelude::BASE64_STANDARD.encode(
+                                        yrs::sync::Message::Sync(SyncMessage::SyncStep2(update))
+                                            .encode_v1(),
+                                    ),
+                                    from: client.profile.id,
+                                };
+
+                                client
+                                    .send_ecast(JBMessage {
+                                        pc: 0,
+                                        re: None,
+                                        result: &result,
+                                    })
+                                    .await
+                                    .wrap_err(
+                                        "Failed to send ecast client a text-map/synced opcode",
+                                    )?;
+
+                                return Ok(());
+                            }
+                            m => bail!("Unimplemented yjs SyncMessage: {:?}", m),
+                        },
+                        yrs::sync::Message::Awareness(a) => {
+                            root.apply_update(a)
+                                .wrap_err("Failed to apply awareness update to text-map")?;
+                        }
+                        m => bail!("Unimplemented yjs Message: {:?}", m),
+                    }
+
+                    for client in room
+                        .connections
+                        .iter()
+                        .filter(|c| {
+                            c.profile.id != client.profile.id && c.profile.role != Role::Host
+                        })
+                        .filter(|c| {
+                            entity
+                                .2
+                                .perms(c.profile.role, c.profile.id)
+                                .is_some_and(|pv| pv.is_readable())
+                        })
+                    {
+                        client
+                            .send_ecast(JBMessage {
+                                pc: 0,
+                                re: None,
+                                result: &result,
+                            })
+                            .await
+                            .wrap_err("Failed to send ecast client a text-map/synced opcode")?;
+                    }
+                }
+            }
+            client
+                .send_ecast(JBMessage {
+                    pc: 0,
+                    re: Some(message.seq),
+                    result: &JBResult::Ok {},
+                })
+                .await
+                .wrap_err("Failed to send ecast client the result of text-map/sync opcode")?;
+        }
+        JBParams::TextMapGet { key, include_nodes } => {
+            if let Some(entity) = room.entities.get(&key) {
+                if let JBValue::Player {
+                    val: JBPlayerValue::TextMap { ref root },
+                    ..
+                } = entity.value().1.val
+                {
+                    let result = {
+                        let snapshot = root.doc().transact().snapshot();
+                        let mut txn = root.doc().transact_mut();
+                        let text_ref = txn
+                            .get_text("ecast")
+                            .ok_or_eyre("The text-map text requested was not found")?;
+                        let text = text_ref.get_string(&txn);
+
+                        JBResult::TextMapState {
+                            key,
+                            text,
+                            attributions: if include_nodes {
+                                let text = text_ref.diff_range(
+                                    &mut txn,
+                                    Some(&Snapshot::default()),
+                                    Some(&snapshot),
+                                    YChange::identity,
+                                );
+
+                                Some(
+                                    text.into_iter()
+                                        .map(|diff| {
+                                            let yrs::Value::Any(yrs::Any::String(text)) =
+                                                diff.insert
+                                            else {
+                                                panic!(
+                                                    "yrs text-map contained \
+                                                data structure other than text"
+                                                )
+                                            };
+                                            let ychange = diff.ychange.unwrap();
+                                            JBTextMapAttribution {
+                                                author: ychange.id.client,
+                                                text,
+                                                pc: 0,
+                                            }
+                                        })
+                                        .collect(),
+                                )
+                            } else {
+                                None
+                            },
+                            from: client.profile.id,
+                        }
+                    };
+                    client
+                        .send_ecast(JBMessage {
+                            pc: 0,
+                            re: Some(message.seq),
+                            result: &result,
+                        })
+                        .await
+                        .wrap_err("Failed to send ecast client text-map/state opcode")?;
+                }
+            }
+        }
         JBParams::DoodleStroke(params) => {
             if let Some(mut entity) = room.entities.get_mut(&params.key) {
                 {
@@ -859,7 +1130,60 @@ async fn process_message(
                     .wrap_err("Failed to send ecast client the result of doodle/stroke opcode")?;
             }
         }
+        JBParams::DoodleUndo(params) => {
+            if let Some(mut entity) = room.entities.get_mut(&params.key) {
+                let len;
+                if let JBValue::Player {
+                    val:
+                        JBPlayerValue::Doodle {
+                            val: ref mut doodle,
+                        },
+                    ..
+                } = entity.value_mut().1.val
+                {
+                    doodle.lines.pop();
+                    len = doodle.lines.len();
+                } else {
+                    len = usize::MAX;
+                }
+                {
+                    let line_value = JBResult::DoodleLineRemoved {
+                        key: Cow::Borrowed(&params.key),
+                        from: client.profile.id,
+                        index: len,
+                    };
 
+                    for client in room
+                        .connections
+                        .iter()
+                        .filter(|c| c.profile.id != client.profile.id)
+                        .filter(|c| {
+                            entity
+                                .2
+                                .perms(c.profile.role, c.profile.id)
+                                .is_some_and(|pv| pv.is_readable())
+                        })
+                    {
+                        client
+                            .send_ecast(JBMessage {
+                                pc: 0,
+                                re: None,
+                                result: &line_value,
+                            })
+                            .await
+                            .wrap_err("Failed to send doodle/line/removed to ecast client")?;
+                    }
+                }
+                client
+                    .send_ecast(JBMessage {
+                        pc: 0,
+                        re: Some(message.seq),
+                        result: &JBResult::Ok {},
+                    })
+                    .await
+                    .wrap_err("Failed to send ecast client the result of doodle/stroke opcode")?;
+            }
+        }
         JBParams::NumberIncrement(params) => {
             if room.entities.get(&params.key).is_some_and(|e| {
                 e.2.perms(client.profile.role, client.profile.id)

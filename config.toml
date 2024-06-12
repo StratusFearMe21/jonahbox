@@ -1,7 +1,9 @@
 # The host which your Jackbox games can access (through HTTPS)
 accessible_host = "192.168.1.10"
 # Whether the TUI should be ran when running this server, set
-# to false if this server is to be run as a daemon
+# to false if this server is to be run as a daemon (we also
+# check if stdout is a TTY or not as well, so you can leave
+# this as true if running as a daemon)
 tui = true
 
 # Controls how the HTTP cache for `jackbox.tv` functions

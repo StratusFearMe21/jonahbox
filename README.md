@@ -14,21 +14,19 @@ This project extends on the work of [InvoxiPlayGames](https://github.com/InvoxiP
 * The Jackbox Party Pack 3
 * The Jackbox Party Pack 4
 * The Jackbox Party Pack 5
-    * Mad Verse City (Requires TTS to be set up)
+    * Mad Verse City (Uses TTS setup)
 * The Jackbox Party Pack 6
 * The Jackbox Party Pack 7
 * The Jackbox Party Pack 8
 * The Jackbox Party Pack 9
 * The Jackbox Party Pack 10
-    * FixyText (does not work, and is probably a wontfix)
+    * FixyText (Uses TTS setup)
 * Drawful 2 International
 
 ### Tested known non-working games:
 
 * The Jackbox Party Pack
     * Disregards the `jbg.config.jet` files, and just contacts Jackbox's servers anyway
-* FixyText
-    * Requires complex API for collaborative text editing, which is not implemented and difficult to reverse engineer.
 
 ## Unimplemented features
 
@@ -66,7 +64,7 @@ Or look in [releases](releases) for a binary.
 
 ### TTS
 
-Mad Verse City requires a tts endpoint in order to generate the audio for the raps. In native mode, this can be done using the [piper](https://github.com/rhasspy/piper) project. First set that up, then go [here](https://github.com/rhasspy/piper/blob/master/VOICES.md) and download the voices and their associated config files to the `voices_path` (Note that the expected name for config files is {voice}.onnx.json, and that it's not named that already). Voices are chosen at random from the `voices_path`, but they will be consistent for each player. You will also need [ffmpeg](https://ffmpeg.org/) installed.
+Mad Verse City and FixyText require a tts endpoint in order to generate the audio for the raps/the text messages. In native mode, this can be done using the [piper](https://github.com/rhasspy/piper) project. First set that up, then go [here](https://github.com/rhasspy/piper/blob/master/VOICES.md) and download the voices and their associated config files to the `voices_path` (Note that the expected name for config files is {voice}.onnx.json, and that it's not named that already). Voices are chosen at random from the `voices_path`, but they will be consistent for each player. You will also need [ffmpeg](https://ffmpeg.org/) installed.
 
 ### Caching games
 

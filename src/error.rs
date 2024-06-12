@@ -17,7 +17,7 @@ use reqwest::Response;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub struct Error(StatusCode, color_eyre::eyre::Report);
+pub struct Error(pub StatusCode, pub color_eyre::eyre::Report);
 
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

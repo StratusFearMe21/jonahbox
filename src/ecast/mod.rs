@@ -111,7 +111,8 @@ pub async fn play_handler(
             async move {
                 if let Err(e) = ws::handle_socket_proxy(host, socket, ecast_req, url_query.0).await
                 {
-                    tracing::error!(error = %e, "Failed to proxy ecast client");
+                    let e = crate::error::Error(StatusCode::INTERNAL_SERVER_ERROR, e);
+                    tracing::error!(error = ?e, "Failed to proxy ecast client");
                 }
             }
         }))
@@ -123,13 +124,15 @@ pub async fn play_handler(
             .on_upgrade(move |socket| async move {
                 match ws::connect_socket(socket, url_query, room).await.wrap_err("Failed to connect ecast client") {
                     Err(e) => {
-                        tracing::error!(%e);
+                    let e = crate::error::Error(StatusCode::INTERNAL_SERVER_ERROR, e);
+                        tracing::error!(?e);
                         return;
                     }
                     Ok(connected) => {
                         sender.send(()).unwrap();
                         if let Err(e) = ws::handle_socket(Arc::clone(&connected.client), Arc::clone(&connected.room), connected.reconnected, connected.read_half, &config.doodles).await {
-                            tracing::error!(id = connected.client.profile.id, role = ?connected.client.profile.role, code = connected.room.room_config.code, error = %e, "Error in WebSocket");
+                            let e = crate::error::Error(StatusCode::INTERNAL_SERVER_ERROR, e);
+                            tracing::error!(id = connected.client.profile.id, role = ?connected.client.profile.role, code = connected.room.room_config.code, error = ?e, "Error in WebSocket");
                             connected.client.disconnect().await;
                         } else {
                             connected.client.disconnect().await;

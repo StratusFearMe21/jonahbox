@@ -7,12 +7,14 @@ use std::{
     },
 };
 
+use base64::Engine;
 use color_eyre::eyre::{self, ContextCompat};
 use indexmap::IndexMap;
 use ringbuf::{traits::Consumer, Cons};
 use serde::{de::Error, ser::SerializeSeq, Deserialize, Serialize, Serializer};
 use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use tokio::io::Interest;
+use yrs::{sync::Awareness, ReadTxn, StateVector, Transact};
 
 use crate::{acl::Role, ecast::ws::JBResult};
 
@@ -28,6 +30,7 @@ impl JBEntity {
             JBType::Number => JBResult::Number(&self.1),
             JBType::Object => JBResult::Object(&self.1),
             JBType::Doodle => JBResult::Doodle(&self.1),
+            JBType::TextMap => JBResult::TextMap(&self.1),
             JBType::AudienceGCounter => JBResult::AudienceGCounter(&self.1),
             JBType::AudiencePnCounter => JBResult::AudiencePnCounter(&self.1),
             JBType::AudienceCountGroup => JBResult::AudienceCountGroup(&self.1),
@@ -129,9 +132,22 @@ pub enum JBPlayerValue {
     Doodle {
         val: JBDoodle,
     },
+    TextMap {
+        #[serde(serialize_with = "serialize_root")]
+        root: Awareness,
+    },
     None {
         val: Option<()>,
     },
+}
+
+fn serialize_root<S>(map: &Awareness, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    base64::prelude::BASE64_STANDARD
+        .encode(map.doc().transact().encode_diff_v1(&StateVector::default()))
+        .serialize(serializer)
 }
 
 #[derive(Serialize, Debug)]
@@ -203,6 +219,8 @@ pub enum JBType {
     Number,
     Object,
     Doodle,
+    #[serde(rename = "text-map")]
+    TextMap,
     #[serde(rename = "audience/g-counter")]
     AudienceGCounter,
     #[serde(rename = "audience/pn-counter")]
@@ -220,6 +238,7 @@ impl JBType {
             Self::Number => "number",
             Self::Object => "object",
             Self::Doodle => "doodle",
+            Self::TextMap => "text-map",
             Self::AudiencePnCounter => "audience/pn-counter",
             Self::AudienceGCounter => "audience/g-counter",
             Self::AudienceCountGroup => "audience/count-group",

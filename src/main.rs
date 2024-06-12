@@ -284,7 +284,9 @@ pub struct Client {
 
 impl Client {
     pub async fn send_ecast(&self, mut message: ecast::ws::JBMessage<'_>) -> eyre::Result<()> {
-        message.pc = self.pc.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if message.pc == 0 {
+            message.pc = self.pc.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
 
         tracing::debug!(?message, "Sending WS Message");
 

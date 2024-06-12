@@ -932,6 +932,7 @@ async fn process_message(
             }
         }
         JBParams::TextMapSync(params) => {
+            let pc = client.pc.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             if let Some(mut entity) = room.entities.get_mut(&params.key) {
                 if let JBValue::Player {
                     val: JBPlayerValue::TextMap { ref mut root },
@@ -949,30 +950,30 @@ async fn process_message(
                             SyncMessage::Update(u) => root.doc().transact_mut().apply_update(
                                 Update::decode_v1(&u).wrap_err("Failed to decode yjs Update v1")?,
                             ),
-                            SyncMessage::SyncStep1(sv) => {
-                                let update = root.doc().transact().encode_state_as_update_v1(&sv);
+                            SyncMessage::SyncStep1(_) => {
+                                // let update = root.doc().transact().encode_state_as_update_v1(&sv);
 
-                                let result = JBResult::TextMapSynced {
-                                    key: Cow::Borrowed(&params.key),
-                                    msg: base64::prelude::BASE64_STANDARD.encode(
-                                        yrs::sync::Message::Sync(SyncMessage::SyncStep2(update))
-                                            .encode_v1(),
-                                    ),
-                                    from: client.profile.id,
-                                };
+                                // let result = JBResult::TextMapSynced {
+                                //     key: Cow::Borrowed(&params.key),
+                                //     msg: base64::prelude::BASE64_STANDARD.encode(
+                                //         yrs::sync::Message::Sync(SyncMessage::SyncStep2(update))
+                                //             .encode_v1(),
+                                //     ),
+                                //     from: client.profile.id,
+                                // };
 
-                                client
-                                    .send_ecast(JBMessage {
-                                        pc: 0,
-                                        re: None,
-                                        result: &result,
-                                    })
-                                    .await
-                                    .wrap_err(
-                                        "Failed to send ecast client a text-map/synced opcode",
-                                    )?;
+                                // client
+                                //     .send_ecast(JBMessage {
+                                //         pc: 0,
+                                //         re: None,
+                                //         result: &result,
+                                //     })
+                                //     .await
+                                //     .wrap_err(
+                                //         "Failed to send ecast client a text-map/synced opcode",
+                                //     )?;
 
-                                return Ok(());
+                                // return Ok(());
                             }
                             m => bail!("Unimplemented yjs SyncMessage: {:?}", m),
                         },
@@ -1009,7 +1010,7 @@ async fn process_message(
             }
             client
                 .send_ecast(JBMessage {
-                    pc: 0,
+                    pc,
                     re: Some(message.seq),
                     result: &JBResult::Ok {},
                 })
@@ -1037,8 +1038,8 @@ async fn process_message(
                             attributions: if include_nodes {
                                 let text = text_ref.diff_range(
                                     &mut txn,
-                                    Some(&Snapshot::default()),
                                     Some(&snapshot),
+                                    Some(&Snapshot::default()),
                                     YChange::identity,
                                 );
 
@@ -1667,6 +1668,13 @@ pub async fn handle_socket_proxy(
                         tracing::debug!(
                             message = %{
                                 json_message.map(|m| -> eyre::Result<String> {
+                                    let message: WSMessage = serde_json::from_str(m).wrap_err_with(|| format!("Failed to deserialize WSMessage: {}", m))?; 
+                                    match message.params {
+                                        JBParams::TextMapSync(JBTextMapSyncParams { msg: yrs::sync::Message::Sync(SyncMessage::SyncStep1(_)), .. }) => {
+                                            tracing::info!("Sync step 1: {}", message.seq);
+                                        }
+                                        _ => {}
+                                    }
                                     if let Ok(jq) = std::process::Command::new("jq")
                                         .stdin(Stdio::piped())
                                         .stdout(Stdio::piped())

@@ -975,13 +975,13 @@ async fn process_message(
 
                                 // return Ok(());
                             }
-                            m => bail!("Unimplemented yjs SyncMessage: {:?}", m),
+                            _ => {}
                         },
                         yrs::sync::Message::Awareness(a) => {
                             root.apply_update(a)
                                 .wrap_err("Failed to apply awareness update to text-map")?;
                         }
-                        m => bail!("Unimplemented yjs Message: {:?}", m),
+                        _ => {}
                     }
 
                     for client in room

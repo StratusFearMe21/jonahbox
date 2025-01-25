@@ -1,0 +1,14 @@
+version: '3.3'
+
+services:
+  johnbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: johnbox
+    container_name: app_johnbox
+    ports:
+      - "8080:80"
+      - "8081:38203"
+    volumes:
+      - "..:/root"
